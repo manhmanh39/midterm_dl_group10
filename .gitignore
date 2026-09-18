@@ -22,3 +22,7 @@ outputs/*.pth
 
 # --- Large Datasets ---
 data/
+*.log
+wandb/
+lightning_logs/
+runs/

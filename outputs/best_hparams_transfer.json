@@ -1,0 +1,10 @@
+{
+  "best_value_auc": 0.7761482713426104,
+  "best_params": {
+    "lr": 0.000660337652947413,
+    "batch_size": 64,
+    "weight_decay": 1.6041427053764704e-05,
+    "optimizer": "adamw",
+    "dropout": 0.4031241845704801
+  }
+}

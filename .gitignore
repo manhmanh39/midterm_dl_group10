@@ -1,0 +1,24 @@
+# --- Python & Cache ---
+__pycache__/
+*.py[cod]
+*$py.class
+.ipynb_checkpoints/
+
+# --- Virtual Environment ---
+venv/
+env/
+ENV/
+
+# --- IDE & System ---
+.vscode/
+.idea/
+.DS_Store
+
+# --- Weights & Checkpoints ---
+checkpoints/
+*.pth
+*.pt
+outputs/*.pth
+
+# --- Large Datasets ---
+data/

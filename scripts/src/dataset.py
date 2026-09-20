@@ -1,27 +1,4 @@
-"""
-VinBigDataDetectionDataset - doc anh + NHIEU bbox/anh (multi-object detection thuc su).
-
-Doc file nhan dinh dang YOLO chuan (moi dong: cls cx cy w h, da normalize [0,1],
-KHONG gioi han so dong/anh - anh co the co 0, 1, hoac nhieu chuc bbox).
-
-Encode target thanh grid tensor kieu YOLOv1/v3 don gian (anchor-free, 1-scale):
-    target shape = (GRID, GRID, 5 + NUM_CLASSES)
-    5 = [objectness, tx, ty, tw, th]
-        - objectness: 1 neu cell nay "chiu trach nhiem" cho 1 object (co tam
-          object roi vao cell), 0 neu khong.
-        - tx, ty: offset cua tam box so voi CANH TREN-TRAI cua cell, in [0,1]
-        - tw, th: width/height cua box, normalized theo CA ANH (khong theo cell),
-          in [0,1] - don gian hoa so voi log-scale cua YOLOv2/v3 de de hoc
-          hon voi CNN tu viet (khong can anchor prior).
-    NUM_CLASSES: one-hot class cho cell do (chi co nghia khi objectness=1)
-
-Neu 2 object co tam roi vao CUNG 1 cell (hiem nhung co the xay ra voi object
-nho + grid thua), object co DIEN TICH LON HON se "thang" (duoc gan vao cell),
-object con lai bi bo qua trong target (han che von co cua thiet ke 1
-object/cell/1-scale - neu can bat toan bo, phai dung multi-scale + anchor
-nhu YOLOv3+, ngoai pham vi bai tap CNN kien truc nay).
-"""
-
+"""VinBigDataDetectionDataset - anh + nhieu bbox/anh, encode grid target kieu YOLO 1-scale."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -33,19 +10,14 @@ from torch.utils.data import Dataset
 
 from scripts.config import NUM_CLASSES, GRID_SIZE, IMAGE_SIZE
 
+cv2.setNumThreads(0)  # tranh oversubscription khi dung nhieu DataLoader workers
+
+_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
 
 class VinBigDataDetectionDataset(Dataset):
     def __init__(self, data_dir: str, image_size: int = IMAGE_SIZE, grid_size: int = GRID_SIZE, augment: bool = False):
-        """
-        Parameters
-        ----------
-        data_dir : thu muc split, phai chua images/ va labels/ (labels dinh
-                   dang YOLO, ghi boi scripts/data/prepare_dataset.py)
-        image_size : kich thuoc anh vuong dau ra
-        grid_size : so cell moi chieu cua detection head (phai KHOP voi
-                    grid_size cua model dang dung, xem scripts.config.GRID_SIZE)
-        augment : bat/tat flip ngang cho tap train
-        """
         self.data_dir = Path(data_dir)
         self.img_dir = self.data_dir / "images"
         self.lbl_dir = self.data_dir / "labels"
@@ -54,11 +26,7 @@ class VinBigDataDetectionDataset(Dataset):
         self.augment = augment
 
         if not self.img_dir.exists():
-            raise FileNotFoundError(
-                f"Khong tim thay thu muc anh: {self.img_dir}. "
-                "Hay chay scripts/data/prepare_dataset.py truoc."
-            )
-
+            raise FileNotFoundError(f"Khong tim thay thu muc anh: {self.img_dir}. Hay chay prepare_dataset.py truoc.")
         self.image_files = sorted(self.img_dir.glob("*.png"))
         if len(self.image_files) == 0:
             raise RuntimeError(f"Khong co anh .png nao trong {self.img_dir}")
@@ -67,7 +35,6 @@ class VinBigDataDetectionDataset(Dataset):
         return len(self.image_files)
 
     def _read_raw_boxes(self, label_path: Path):
-        """Doc toan bo box trong file .txt, tra ve list[(cls_id, cx, cy, w, h)]."""
         boxes = []
         if label_path.exists():
             text = label_path.read_text().strip()
@@ -82,41 +49,29 @@ class VinBigDataDetectionDataset(Dataset):
                         boxes.append((cls_id, cx, cy, w, h))
         return boxes
 
+    def get_raw_boxes(self, idx: int):
+        """GT that tu file label (khong mat box do va cham cell). Dung cho mAP."""
+        return self._read_raw_boxes(self.lbl_dir / f"{self.image_files[idx].stem}.txt")
+
     def _encode_grid_target(self, boxes):
-        """
-        Chuyen list box (normalized ca anh) thanh grid target tensor
-        (GRID, GRID, 5 + NUM_CLASSES).
-        """
         G = self.grid_size
         target = np.zeros((G, G, 5 + NUM_CLASSES), dtype=np.float32)
-        # Luu dien tich cua box da gan cho tung cell, de xu ly xung dot
-        # (2 box cung roi vao 1 cell -> giu box lon hon)
         assigned_area = np.zeros((G, G), dtype=np.float32)
 
         for cls_id, cx, cy, w, h in boxes:
-            # Xac dinh cell chua tam box
-            gx = min(int(cx * G), G - 1)
-            gy = min(int(cy * G), G - 1)
-
+            gx = min(max(int(cx * G), 0), G - 1)
+            gy = min(max(int(cy * G), 0), G - 1)
             area = w * h
             if target[gy, gx, 0] == 1.0 and area <= assigned_area[gy, gx]:
-                # Cell nay da co object khac lon hon -> bo qua object nay
                 continue
-
-            # Offset cua tam box so voi canh trai-tren cua cell, in [0,1]
-            tx = cx * G - gx
-            ty = cy * G - gy
-
-            target[gy, gx, 0] = 1.0          # objectness
-            target[gy, gx, 1] = tx
-            target[gy, gx, 2] = ty
-            target[gy, gx, 3] = w             # normalized theo ca anh
+            target[gy, gx, 0] = 1.0
+            target[gy, gx, 1] = cx * G - gx
+            target[gy, gx, 2] = cy * G - gy
+            target[gy, gx, 3] = w
             target[gy, gx, 4] = h
             target[gy, gx, 5:] = 0.0
-            target[gy, gx, 5 + cls_id] = 1.0  # one-hot class
-
+            target[gy, gx, 5 + cls_id] = 1.0
             assigned_area[gy, gx] = area
-
         return target
 
     def __getitem__(self, idx: int):
@@ -127,7 +82,6 @@ class VinBigDataDetectionDataset(Dataset):
         if img is None:
             raise RuntimeError(f"Khong doc duoc anh: {img_path}")
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
         if img.shape[0] != self.image_size or img.shape[1] != self.image_size:
             img = cv2.resize(img, (self.image_size, self.image_size), interpolation=cv2.INTER_AREA)
 
@@ -139,15 +93,11 @@ class VinBigDataDetectionDataset(Dataset):
 
         target = self._encode_grid_target(boxes)
 
-        img = img.astype(np.float32) / 255.0
+        img = (img.astype(np.float32) / 255.0 - _MEAN) / _STD   # chuan hoa ImageNet
         img_tensor = torch.from_numpy(img).permute(2, 0, 1).contiguous()
-        target_tensor = torch.from_numpy(target)
-
-        return img_tensor, target_tensor
+        return img_tensor, torch.from_numpy(target)
 
 
 def collate_fn(batch):
-    """Ghep batch don gian (moi anh co so box khac nhau nhung target da la
-    tensor grid co kich thuoc co dinh, nen stack binh thuong duoc)."""
     imgs, targets = zip(*batch)
     return torch.stack(imgs, dim=0), torch.stack(targets, dim=0)

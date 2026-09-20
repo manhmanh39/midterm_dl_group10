@@ -1,0 +1,10 @@
+{
+  "best_value_iou": 0.25985090360821533,
+  "best_params": {
+    "lr": 9.180504074572426e-05,
+    "batch_size": 64,
+    "weight_decay": 1.987021538542864e-06,
+    "optimizer": "adam",
+    "lambda_coord": 2.7884411338075514
+  }
+}

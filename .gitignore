@@ -21,7 +21,7 @@ checkpoints/
 outputs/*.pth
 
 # --- Large Datasets ---
-data/
+/data/
 *.log
 wandb/
 lightning_logs/

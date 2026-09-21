@@ -82,6 +82,7 @@ def run_develop_phase(
             backbone_name=resolved["backbone"],
             seed=seed,
             use_tuned=cli_args.use_tuned,
+            parameter_sources=resolved.get("source"),
         )
 
         # 3. Nạp lại Checkpoint tốt nhất để Calibrate trên tập Validation

@@ -92,6 +92,7 @@ def run_multi_seed_develop(
                 backbone_name=resolved["backbone"],
                 seed=seed,
                 use_tuned=resolved["use_tuned"],
+                parameter_sources=resolved.get("source"),
             )
 
             # 3. Load Best Checkpoint & Calibrate on Validation Only

@@ -194,15 +194,22 @@ def global_preflight_check(
     with open(lock_file, "r", encoding="utf-8") as f:
         lock_data = json.load(f)
 
-    # 1. Kiểm tra Git Clean Tree (nếu không phải demo data)
+    # 1. Kiểm tra Git Clean Tree và Git Commit Match (nếu không phải demo data)
     current_dataset_meta = compute_dataset_fingerprint(data_dir=data_dir)
-    is_demo = current_dataset_meta["is_demo_data"]
+    is_demo = current_dataset_meta.get("is_demo_data", True)
 
     if enforce_clean_git or not is_demo:
         if git_worktree_is_dirty():
             raise RuntimeError(
                 "[FAIL CLOSED] Working tree của Git đang có thay đổi chưa commit!\n"
                 "Giao thức P1 bắt buộc working tree phải sạch (git status clean) khi chạy Final-Test trên real data."
+            )
+        locked_commit = lock_data.get("git_commit")
+        current_commit = get_git_commit()
+        if locked_commit and current_commit != locked_commit:
+            raise RuntimeError(
+                f"[FAIL CLOSED] Git commit hiện tại ({current_commit}) không khớp với commit đã khóa trong protocol_lock.json ({locked_commit})!\n"
+                "Giao thức P1 yêu cầu mã nguồn phải ở đúng commit đã khóa khi chạy Final-Test."
             )
 
     # 2. Kiểm tra Dataset Fingerprint
@@ -267,34 +274,53 @@ def verify_fail_closed_provenance(
     th_prov = threshold_data.get("provenance", {})
     ck_prov = checkpoint_data.get("provenance", {})
 
-    th_model = str(th_prov.get("model_name")).lower()
+    REQUIRED_PROV_FIELDS = [
+        "checkpoint_sha256",
+        "dataset_fingerprint",
+        "git_commit",
+        "model_name",
+        "seed",
+    ]
+    for field in REQUIRED_PROV_FIELDS:
+        if not th_prov.get(field):
+            raise ValueError(f"[FAIL CLOSED] Threshold provenance thiếu trường bắt buộc: '{field}'")
+        ck_val = ck_prov.get(field) if ck_prov.get(field) is not None else checkpoint_data.get(field)
+        if field != "checkpoint_sha256" and (ck_val is None or ck_val == ""):
+            raise ValueError(f"[FAIL CLOSED] Checkpoint provenance thiếu trường bắt buộc: '{field}'")
+
+    th_model = str(th_prov["model_name"]).lower()
     ck_model = str(checkpoint_data.get("model_name", ck_prov.get("model_name"))).lower()
     if th_model != ck_model:
         raise ValueError(f"[FAIL CLOSED] Sai lệch Model Name: {th_model} != {ck_model}")
 
-    th_seed = th_prov.get("seed")
+    th_seed = th_prov["seed"]
     ck_seed = checkpoint_data.get("seed", ck_prov.get("seed"))
     if th_seed != ck_seed:
         raise ValueError(f"[FAIL CLOSED] Sai lệch Seed: {th_seed} != {ck_seed}")
 
-    th_ckpt_hash = th_prov.get("checkpoint_sha256")
-    if th_ckpt_hash and th_ckpt_hash != actual_ckpt_sha256:
-        raise ValueError(f"[FAIL CLOSED] Checkpoint bị sửa đổi sau khi calibrate!")
+    th_ckpt_hash = th_prov["checkpoint_sha256"]
+    if th_ckpt_hash != actual_ckpt_sha256:
+        raise ValueError(f"[FAIL CLOSED] Checkpoint bị sửa đổi sau khi calibrate! (Thresh: {th_ckpt_hash} != Actual: {actual_ckpt_sha256})")
 
     curr_fingerprint = current_dataset_meta["dataset_fingerprint"]
-    th_fingerprint = th_prov.get("dataset_fingerprint")
-    if th_fingerprint and th_fingerprint != curr_fingerprint:
-        raise ValueError(f"[FAIL CLOSED] Dataset đã bị thay đổi sau khi calibrate!")
+    th_fingerprint = th_prov["dataset_fingerprint"]
+    if th_fingerprint != curr_fingerprint:
+        raise ValueError(f"[FAIL CLOSED] Dataset đã bị thay đổi sau khi calibrate! (Thresh FP: {th_fingerprint} != Current: {curr_fingerprint})")
 
     ck_fingerprint = ck_prov.get("dataset_fingerprint")
-    if ck_fingerprint and ck_fingerprint != curr_fingerprint:
-        raise ValueError(f"[FAIL CLOSED] Dataset của Checkpoint không khớp Dataset hiện tại!")
+    if ck_fingerprint != curr_fingerprint:
+        raise ValueError(f"[FAIL CLOSED] Dataset của Checkpoint không khớp Dataset hiện tại! (Ckpt FP: {ck_fingerprint} != Current: {curr_fingerprint})")
+
+    th_commit = th_prov.get("git_commit")
+    ck_commit = ck_prov.get("git_commit")
+    if th_commit != ck_commit:
+        raise ValueError(f"[FAIL CLOSED] Git commit không khớp giữa Checkpoint ({ck_commit}) và Thresholds ({th_commit})!")
 
     if not current_dataset_meta.get("is_demo_data", True):
-        if ck_prov.get("git_dirty") is True:
-            raise RuntimeError(f"[FAIL CLOSED] Checkpoint {checkpoint_path.name} được huấn luyện khi Git working tree bị dirty!")
-        if th_prov.get("git_dirty") is True:
-            raise RuntimeError(f"[FAIL CLOSED] Thresholds {threshold_path.name} được calibrate khi Git working tree bị dirty!")
+        if ck_prov.get("git_dirty") is not False:
+            raise RuntimeError(f"[FAIL CLOSED] Checkpoint {checkpoint_path.name} được huấn luyện khi Git working tree bị dirty (git_dirty={ck_prov.get('git_dirty')})!")
+        if th_prov.get("git_dirty") is not False:
+            raise RuntimeError(f"[FAIL CLOSED] Thresholds {threshold_path.name} được calibrate khi Git working tree bị dirty (git_dirty={th_prov.get('git_dirty')})!")
 
     print(f"[provenance] ✅ Verification PASS cho {th_model} (seed={th_seed}).")
 
@@ -395,12 +421,18 @@ def save_calibrated_thresholds(
 
     ckpt_hash = compute_file_sha256(checkpoint_path)
 
+    device_obj = config.DEVICE
+    device_name = torch.cuda.get_device_name(device_obj) if (device_obj.type == "cuda" and torch.cuda.is_available()) else "CPU"
+
     provenance = {
         "timestamp": datetime.now().isoformat(),
         "git_commit": get_git_commit(),
         "git_dirty": git_worktree_is_dirty(),
         "model_name": model_name,
         "seed": seed,
+        "device": str(device_obj),
+        "device_name": device_name,
+        "is_multilabel": config.IS_MULTILABEL,
         "checkpoint_path": str(checkpoint_path),
         "checkpoint_sha256": ckpt_hash,
         "dataset_fingerprint": dataset_meta["dataset_fingerprint"],

@@ -160,18 +160,24 @@ class TestFailClosedProvenance(unittest.TestCase):
             ckpt_path = tmp_path / "best.pth"
             th_path = tmp_path / "calibrated_thresholds.json"
 
-            # Lưu checkpoint giả
+            # Lưu checkpoint giả có đầy đủ required provenance fields
             torch.save({
                 "model_name": "simple",
                 "seed": 202601,
                 "model_state_dict": {},
-                "provenance": {"model_name": "simple", "seed": 202601},
+                "provenance": {
+                    "model_name": "simple",
+                    "seed": 202601,
+                    "git_commit": "abc1234",
+                    "git_dirty": False,
+                    "dataset_fingerprint": "fake_fingerprint_123",
+                },
             }, ckpt_path)
 
             ckpt_hash = compute_file_sha256(ckpt_path)
 
             # Lưu threshold khớp
-            dataset_meta = {"dataset_fingerprint": "fake_fingerprint_123"}
+            dataset_meta = {"dataset_fingerprint": "fake_fingerprint_123", "is_demo_data": False}
             with open(th_path, "w", encoding="utf-8") as f:
                 json.dump({
                     "provenance": {
@@ -179,6 +185,8 @@ class TestFailClosedProvenance(unittest.TestCase):
                         "seed": 202601,
                         "checkpoint_sha256": ckpt_hash,
                         "dataset_fingerprint": "fake_fingerprint_123",
+                        "git_commit": "abc1234",
+                        "git_dirty": False,
                     },
                     "thresholds": [0.5] * 15,
                 }, f)
@@ -194,12 +202,82 @@ class TestFailClosedProvenance(unittest.TestCase):
             with self.assertRaises(ValueError):
                 verify_fail_closed_provenance(ckpt_path, th_path, dataset_meta)
 
+    def test_missing_required_provenance_field_aborts(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            ckpt_path = tmp_path / "best.pth"
+            th_path = tmp_path / "calibrated_thresholds.json"
+
+            torch.save({
+                "model_name": "simple",
+                "seed": 202601,
+                "model_state_dict": {},
+                "provenance": {
+                    "model_name": "simple",
+                    "seed": 202601,
+                    # Thiếu git_commit và dataset_fingerprint
+                },
+            }, ckpt_path)
+            ckpt_hash = compute_file_sha256(ckpt_path)
+
+            dataset_meta = {"dataset_fingerprint": "fake_fingerprint_123", "is_demo_data": False}
+            with open(th_path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "provenance": {
+                        "model_name": "simple",
+                        "seed": 202601,
+                        "checkpoint_sha256": ckpt_hash,
+                        # Thiếu git_commit
+                    },
+                    "thresholds": [0.5] * 15,
+                }, f)
+
+            with self.assertRaises(ValueError) as ctx:
+                verify_fail_closed_provenance(ckpt_path, th_path, dataset_meta)
+            self.assertIn("FAIL CLOSED", str(ctx.exception))
+
     def test_global_preflight_missing_lock_aborts(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
             missing_lock = tmp_path / "non_existent_protocol_lock.json"
             with self.assertRaises(FileNotFoundError):
                 global_preflight_check(lock_file=missing_lock)
+
+    def test_global_preflight_commit_mismatch_aborts(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            ckpt_path = tmp_path / "best.pth"
+            th_path = tmp_path / "calibrated_thresholds.json"
+            lock_path = tmp_path / "protocol_lock.json"
+
+            ckpt_path.write_text("dummy checkpoint content")
+            th_path.write_text(json.dumps({"thresholds": [0.5]*15}))
+
+            real_ckpt_hash = compute_file_sha256(ckpt_path)
+            real_th_hash = compute_file_sha256(th_path)
+
+            lock_data = {
+                "git_commit": "locked_commit_aaa",
+                "dataset_fingerprint": "mock_fp",
+                "experiments": [{
+                    "model": "simple",
+                    "seed": 202601,
+                    "checkpoint_rel_path": "best.pth",
+                    "checkpoint_sha256": real_ckpt_hash,
+                    "threshold_rel_path": "calibrated_thresholds.json",
+                    "threshold_sha256": real_th_hash,
+                }]
+            }
+            lock_path.write_text(json.dumps(lock_data))
+
+            from unittest.mock import patch
+            with patch("experiment_config.DEVELOP_DIR", tmp_path):
+                with patch("experiment_config.compute_dataset_fingerprint", return_value={"dataset_fingerprint": "mock_fp", "is_demo_data": False}):
+                    with patch("experiment_config.git_worktree_is_dirty", return_value=False):
+                        with patch("experiment_config.get_git_commit", return_value="current_different_commit_bbb"):
+                            with self.assertRaises(RuntimeError) as ctx:
+                                global_preflight_check(lock_file=lock_path, enforce_clean_git=True)
+                            self.assertIn("Git commit hiện tại", str(ctx.exception))
 
     def test_global_preflight_tampered_checkpoint_aborts(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -227,9 +305,6 @@ class TestFailClosedProvenance(unittest.TestCase):
             }
             lock_path.write_text(json.dumps(lock_data))
 
-            # Sửa đổi DEVELOP_DIR tạm thời bằng monkeypatch hoặc truyền lock
-            # Ở đây global_preflight_check tìm file relative to DEVELOP_DIR
-            # Kiểm tra xem hash sai lệch có bị phát hiện không
             from unittest.mock import patch
             with patch("experiment_config.DEVELOP_DIR", tmp_path):
                 with patch("experiment_config.compute_dataset_fingerprint", return_value={"dataset_fingerprint": "mock_fp", "is_demo_data": True}):

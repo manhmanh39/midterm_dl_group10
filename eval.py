@@ -138,15 +138,24 @@ def evaluate_frozen_model(
         "total_inconsistency_rate_adjusted": 0.0,
     })
 
+    device_obj = device if isinstance(device, torch.device) else torch.device(device)
+    device_name = torch.cuda.get_device_name(device_obj) if (device_obj.type == "cuda" and torch.cuda.is_available()) else "CPU"
+
     # 10. Tạo Provenance đầy đủ
+    from datetime import datetime
     provenance = {
+        "timestamp": datetime.now().isoformat(),
         "git_commit": get_git_commit(),
         "git_dirty": git_worktree_is_dirty(),
-        "dataset_fingerprint": dataset_meta["dataset_fingerprint"],
-        "checkpoint_sha256": compute_file_sha256(checkpoint_path),
-        "threshold_sha256": compute_file_sha256(threshold_path),
         "model_name": model_name,
         "seed": seed,
+        "device": str(device_obj),
+        "device_name": device_name,
+        "is_multilabel": config.IS_MULTILABEL,
+        "checkpoint_sha256": compute_file_sha256(checkpoint_path),
+        "threshold_sha256": compute_file_sha256(threshold_path),
+        "dataset_fingerprint": dataset_meta["dataset_fingerprint"],
+        "data_dir": dataset_meta.get("data_dir"),
     }
 
     # 11. Lưu Artifacts

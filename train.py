@@ -160,6 +160,7 @@ def train(
     backbone_name: str = "resnet50",
     seed: int = config.SEED,
     use_tuned: bool = False,
+    parameter_sources: Optional[Dict[str, str]] = None,
     **kwargs: Any,
 ) -> Path:
     """
@@ -276,6 +277,7 @@ def train(
             "val_exact_match_acc": round(val_exact_acc, 4),
             "val_auc": round(val_auc, 4) if not np.isnan(val_auc) else None,
             "learning_rate": current_lr,
+            "backbone_frozen": bool(is_transfer and epoch <= config.FREEZE_EPOCHS),
             "duration_sec": round(dur, 2),
         })
 
@@ -312,6 +314,10 @@ def train(
                     "data_dir": str(dataset_meta.get("data_dir")),
                     "model_name": model_name,
                     "seed": seed,
+                    "device": str(device),
+                    "device_name": torch.cuda.get_device_name(device) if (device.type == "cuda" and torch.cuda.is_available()) else "CPU",
+                    "is_multilabel": config.IS_MULTILABEL,
+                    "parameter_sources": parameter_sources or kwargs.get("source", {}),
                     "hyperparameters": {
                         "epochs": epochs,
                         "batch_size": batch_size,

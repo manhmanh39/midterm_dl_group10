@@ -399,5 +399,29 @@ class TestAccuracyMetricsDistinction(unittest.TestCase):
         self.assertEqual(macro["macro_accuracy_14_fixed"], 1.0)
 
 
+class TestZeroBypassRealDataProtocol(unittest.TestCase):
+    def test_cannot_skip_preflight_on_real_data(self):
+        from unittest.mock import patch
+        from eval import evaluate_model
+
+        with patch("eval.compute_dataset_fingerprint", return_value={"dataset_fingerprint": "mock_fp", "is_demo_data": False}):
+            with self.assertRaises(RuntimeError) as ctx:
+                evaluate_model(model_name="simple", enforce_preflight=False)
+            self.assertIn("Giao thức cấm bỏ qua preflight", str(ctx.exception))
+
+    def test_missing_lock_on_real_data_aborts(self):
+        from unittest.mock import patch
+        from eval import evaluate_model
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            with patch("eval.compute_dataset_fingerprint", return_value={"dataset_fingerprint": "mock_fp", "is_demo_data": False}):
+                with patch("eval.DEVELOP_DIR", tmp_path):
+                    with self.assertRaises(FileNotFoundError) as ctx:
+                        evaluate_model(model_name="simple", enforce_preflight=True)
+                    self.assertIn("Không tìm thấy file khóa giao thức bắt buộc", str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -213,17 +213,35 @@ def evaluate_model(
     else:
         th_file = Path(threshold_path)
 
-    # GLOBAL PREFLIGHT CHECK trước khi mở Test DataLoader
-    if enforce_preflight:
+    # GLOBAL PREFLIGHT CHECK TRƯỚC KHI MỞ TEST DATALOADER
+    dataset_meta = compute_dataset_fingerprint(data_dir=data_dir)
+    is_demo = dataset_meta.get("is_demo_data", True)
+
+    if not is_demo:
+        if not enforce_preflight:
+            raise RuntimeError(
+                "[FAIL CLOSED] Giao thức cấm bỏ qua preflight (--skip_preflight) khi chạy Final-Test trên tập dữ liệu thật!"
+            )
         lock_file = DEVELOP_DIR / "protocol_lock.json"
-        if lock_file.exists():
-            global_preflight_check(data_dir=data_dir, lock_file=lock_file)
+        if not lock_file.exists():
+            raise FileNotFoundError(
+                f"\n[FAIL CLOSED] Không tìm thấy file khóa giao thức bắt buộc: {lock_file}!\n"
+                "Trên tập dữ liệu thật, Giao thức P1 yêu cầu PHẢI hoàn tất phase develop cho toàn bộ "
+                "9 thí nghiệm (3 models x 3 seeds) và đóng băng qua protocol_lock.json TRƯỚC KHI mở Final-Test DataLoader."
+            )
+        global_preflight_check(data_dir=data_dir, lock_file=lock_file, enforce_clean_git=True)
+    else:
+        # Trong môi trường demo/debug data
+        if enforce_preflight:
+            lock_file = DEVELOP_DIR / "protocol_lock.json"
+            if lock_file.exists():
+                global_preflight_check(data_dir=data_dir, lock_file=lock_file, enforce_clean_git=False)
+            else:
+                verify_fail_closed_provenance(ckpt_file, th_file, dataset_meta)
         else:
-            # Nếu chạy đơn lẻ trong debug, vẫn kiểm tra single provenance
-            dataset_meta = compute_dataset_fingerprint(data_dir=data_dir)
             verify_fail_closed_provenance(ckpt_file, th_file, dataset_meta)
 
-    # TẠO TEST DATALOADER CHỈ KHI PREFLIGHT ĐÃ PASS
+    # TẠO TEST DATALOADER CHỈ KHI PREFLIGHT ĐÃ PASS 100%
     _, _, test_loader, class_names, _ = get_dataloaders(data_dir=data_dir, batch_size=batch_size, seed=seed)
 
     return evaluate_frozen_model(

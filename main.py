@@ -143,17 +143,23 @@ def run_final_test_phase(
 
     # 1. BẮT BUỘC: GLOBAL PREFLIGHT CHECK TRƯỚC KHI MỞ TEST DATALOADER
     print(">>> [FINAL-TEST] Thực hiện Global Preflight Check trên toàn bộ artifacts đã khóa...")
+    dataset_meta = compute_dataset_fingerprint(data_dir=data_dir)
+    is_demo = dataset_meta.get("is_demo_data", True)
+
     lock_file = DEVELOP_DIR / "protocol_lock.json"
-    if lock_file.exists():
-        global_preflight_check(data_dir=data_dir, lock_file=lock_file)
-    else:
-        # Nếu chưa tạo manifest 9 seed, kiểm tra dataset và working tree
-        dataset_meta = compute_dataset_fingerprint(data_dir=data_dir)
-        if not dataset_meta["is_demo_data"] and git_worktree_is_dirty():
-            raise RuntimeError(
-                "[FAIL CLOSED] Working tree của Git đang có thay đổi chưa commit!\n"
-                "Giao thức P1 bắt buộc working tree phải sạch khi chạy Final-Test trên real data."
+    if not is_demo:
+        if not lock_file.exists():
+            raise FileNotFoundError(
+                f"\n[FAIL CLOSED] Không tìm thấy file khóa giao thức bắt buộc: {lock_file}!\n"
+                "Trên tập dữ liệu thật, Giao thức P1 yêu cầu PHẢI hoàn tất phase develop cho toàn bộ "
+                "các thí nghiệm và đóng băng qua protocol_lock.json TRƯỚC KHI mở Final-Test DataLoader."
             )
+        global_preflight_check(data_dir=data_dir, lock_file=lock_file, enforce_clean_git=True)
+    else:
+        if lock_file.exists():
+            global_preflight_check(data_dir=data_dir, lock_file=lock_file, enforce_clean_git=False)
+        else:
+            print(">>> [FINAL-TEST] Chế độ demo: bỏ qua global preflight vì chưa có protocol_lock.json.")
 
     # 2. CHỈ TẠO TEST DATALOADER SAU KHI PREFLIGHT ĐÃ HOÀN TOÀN HỢP LỆ
     print("\n>>> [FINAL-TEST] Tạo Test DataLoader độc lập...")

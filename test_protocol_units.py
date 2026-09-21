@@ -312,6 +312,41 @@ class TestFailClosedProvenance(unittest.TestCase):
                         global_preflight_check(lock_file=lock_path)
                     self.assertIn("FAIL CLOSED", str(ctx.exception))
 
+    def test_global_preflight_missing_git_commit_aborts(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            lock_path = tmp_path / "protocol_lock.json"
+
+            # lock_data không có trường git_commit
+            lock_data = {
+                "dataset_fingerprint": "mock_fp",
+                "experiments": []
+            }
+            lock_path.write_text(json.dumps(lock_data))
+
+            from unittest.mock import patch
+            with patch("experiment_config.DEVELOP_DIR", tmp_path):
+                with patch("experiment_config.compute_dataset_fingerprint", return_value={"dataset_fingerprint": "mock_fp", "is_demo_data": False}):
+                    with patch("experiment_config.git_worktree_is_dirty", return_value=False):
+                        with self.assertRaises(ValueError) as ctx:
+                            global_preflight_check(lock_file=lock_path, enforce_clean_git=True)
+                        self.assertIn("thiếu trường bắt buộc 'git_commit'", str(ctx.exception))
+
+    def test_git_checks_fail_closed_on_command_error(self):
+        from unittest.mock import patch
+        import subprocess
+        from experiment_config import git_worktree_is_dirty, get_git_commit
+
+        with patch("subprocess.check_output", side_effect=subprocess.CalledProcessError(1, "git")):
+            # Không được fail-open (trả về False hay uncommitted_workspace) khi allow_fallback=False
+            with self.assertRaises(RuntimeError) as ctx_dirty:
+                git_worktree_is_dirty()
+            self.assertIn("FAIL CLOSED", str(ctx_dirty.exception))
+
+            with self.assertRaises(RuntimeError) as ctx_commit:
+                get_git_commit()
+            self.assertIn("FAIL CLOSED", str(ctx_commit.exception))
+
 
 class TestModelFactoryAndReload(unittest.TestCase):
     def test_transfer_reload_without_pretrained(self):

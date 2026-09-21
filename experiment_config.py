@@ -22,21 +22,28 @@ FINAL_TEST_DIR = config.OUTPUT_DIR / "final_test"
 BENCHMARK_DIR = config.OUTPUT_DIR / "benchmarks"
 
 
-def get_git_commit() -> str:
-    """Lấy mã băm Git commit hiện tại (HEAD) của repository."""
+def get_git_commit(allow_fallback: bool = False) -> str:
+    """Lấy mã băm Git commit hiện tại (HEAD) của repository. Fail-closed nếu thất bại."""
     try:
         commit = subprocess.check_output(
             ["git", "rev-parse", "HEAD"],
             cwd=str(config.BASE_DIR),
             stderr=subprocess.DEVNULL,
         ).decode("utf-8").strip()
+        if not commit:
+            raise RuntimeError("git rev-parse HEAD trả về kết quả rỗng.")
         return commit
-    except Exception:
-        return "uncommitted_workspace"
+    except Exception as e:
+        if allow_fallback:
+            return "uncommitted_workspace"
+        raise RuntimeError(
+            f"[FAIL CLOSED] Không thể xác định Git commit tại '{config.BASE_DIR}'! "
+            f"Giao thức yêu cầu môi trường Git hợp lệ."
+        ) from e
 
 
-def git_worktree_is_dirty() -> bool:
-    """Kiểm tra xem working tree có file nào bị modified/uncommitted hay không."""
+def git_worktree_is_dirty(allow_fallback: bool = False) -> bool:
+    """Kiểm tra xem working tree có file nào bị modified/uncommitted hay không. Fail-closed nếu thất bại."""
     try:
         status = subprocess.check_output(
             ["git", "status", "--porcelain"],
@@ -44,8 +51,13 @@ def git_worktree_is_dirty() -> bool:
             stderr=subprocess.DEVNULL,
         ).decode("utf-8").strip()
         return len(status) > 0
-    except Exception:
-        return False
+    except Exception as e:
+        if allow_fallback:
+            return False
+        raise RuntimeError(
+            f"[FAIL CLOSED] Không thể kiểm tra trạng thái Git working tree tại '{config.BASE_DIR}'! "
+            f"Giao thức yêu cầu xác minh working tree sạch."
+        ) from e
 
 
 def compute_file_sha256(filepath: Optional[Path]) -> Optional[str]:
@@ -205,11 +217,19 @@ def global_preflight_check(
                 "Giao thức P1 bắt buộc working tree phải sạch (git status clean) khi chạy Final-Test trên real data."
             )
         locked_commit = lock_data.get("git_commit")
+        if not locked_commit:
+            raise ValueError("[FAIL CLOSED] protocol_lock.json thiếu trường bắt buộc 'git_commit'!")
+
         current_commit = get_git_commit()
-        if locked_commit and current_commit != locked_commit:
+        if current_commit != locked_commit:
             raise RuntimeError(
                 f"[FAIL CLOSED] Git commit hiện tại ({current_commit}) không khớp với commit đã khóa trong protocol_lock.json ({locked_commit})!\n"
                 "Giao thức P1 yêu cầu mã nguồn phải ở đúng commit đã khóa khi chạy Final-Test."
+            )
+
+        if lock_data.get("git_dirty") is not False:
+            raise RuntimeError(
+                f"[FAIL CLOSED] protocol_lock.json được tạo khi Git working tree bị dirty (git_dirty={lock_data.get('git_dirty')})!"
             )
 
     # 2. Kiểm tra Dataset Fingerprint

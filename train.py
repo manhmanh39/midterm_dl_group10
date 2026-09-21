@@ -244,6 +244,9 @@ def train(
             )
             scheduler = _build_scheduler(optimizer_obj, epochs - epoch + 1)
 
+        # Lấy LR thực tế dùng cho epoch này trước khi train và trước khi scheduler step
+        current_lr = float(optimizer_obj.param_groups[0]["lr"])
+
         train_loss, train_per_label_acc, train_exact_acc = train_one_epoch(
             model, train_loader, criterion, optimizer_obj, device
         )
@@ -251,13 +254,7 @@ def train(
             model, val_loader, criterion, device
         )
 
-        if isinstance(scheduler, ReduceLROnPlateau):
-            scheduler.step(val_loss)
-        else:
-            scheduler.step()
-
         dur = time.time() - epoch_start
-        current_lr = optimizer_obj.param_groups[0]["lr"]
 
         print(
             f"Epoch [{epoch:02d}/{epochs:02d}] ({dur:.1f}s) | "
@@ -280,6 +277,11 @@ def train(
             "backbone_frozen": bool(is_transfer and epoch <= config.FREEZE_EPOCHS),
             "duration_sec": round(dur, 2),
         })
+
+        if isinstance(scheduler, ReduceLROnPlateau):
+            scheduler.step(val_loss)
+        else:
+            scheduler.step()
 
         current_value = {"loss": val_loss, "acc": val_per_label_acc, "auc": val_auc}[config.BEST_METRIC]
         is_better = (

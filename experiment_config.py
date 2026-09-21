@@ -115,6 +115,12 @@ def generate_protocol_lock(
     sau khi phase develop hoàn tất và TRƯỚC KHI mở bất kỳ final-test nào.
     """
     dataset_meta = compute_dataset_fingerprint(data_dir=data_dir)
+    if not dataset_meta.get("is_demo_data", True) and git_worktree_is_dirty():
+        raise RuntimeError(
+            "[FAIL CLOSED] Working tree của Git đang có thay đổi chưa commit!\n"
+            "Giao thức P1 bắt buộc working tree phải sạch trước khi tạo protocol_lock.json."
+        )
+
     lock_file = DEVELOP_DIR / "protocol_lock.json"
     DEVELOP_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -280,6 +286,16 @@ def verify_fail_closed_provenance(
     if th_fingerprint and th_fingerprint != curr_fingerprint:
         raise ValueError(f"[FAIL CLOSED] Dataset đã bị thay đổi sau khi calibrate!")
 
+    ck_fingerprint = ck_prov.get("dataset_fingerprint")
+    if ck_fingerprint and ck_fingerprint != curr_fingerprint:
+        raise ValueError(f"[FAIL CLOSED] Dataset của Checkpoint không khớp Dataset hiện tại!")
+
+    if not current_dataset_meta.get("is_demo_data", True):
+        if ck_prov.get("git_dirty") is True:
+            raise RuntimeError(f"[FAIL CLOSED] Checkpoint {checkpoint_path.name} được huấn luyện khi Git working tree bị dirty!")
+        if th_prov.get("git_dirty") is True:
+            raise RuntimeError(f"[FAIL CLOSED] Thresholds {threshold_path.name} được calibrate khi Git working tree bị dirty!")
+
     print(f"[provenance] ✅ Verification PASS cho {th_model} (seed={th_seed}).")
 
 
@@ -371,6 +387,12 @@ def save_calibrated_thresholds(
     save_dir = DEVELOP_DIR / model_name / f"seed{seed}"
     save_dir.mkdir(parents=True, exist_ok=True)
 
+    if not dataset_meta.get("is_demo_data", True) and git_worktree_is_dirty():
+        raise RuntimeError(
+            "[FAIL CLOSED] Working tree của Git đang có thay đổi chưa commit!\n"
+            "Giao thức P1 bắt buộc working tree phải sạch khi calibrate thresholds trên real data."
+        )
+
     ckpt_hash = compute_file_sha256(checkpoint_path)
 
     provenance = {
@@ -427,6 +449,7 @@ def save_final_test_artifacts(
         "class_id", "class_name", "support_positive", "support_negative",
         "roc_auc", "ap", "optimal_threshold",
         "f1_fixed", "f1_calibrated",
+        "accuracy_fixed", "accuracy_calibrated",
         "sensitivity_fixed", "sensitivity_calibrated",
         "specificity_fixed", "specificity_calibrated",
     ]

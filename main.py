@@ -96,6 +96,8 @@ def run_develop_phase(
             model_kwargs["backbone_name"] = resolved["backbone"]
         if resolved.get("dropout") is not None:
             model_kwargs["dropout"] = resolved["dropout"]
+        model_kwargs["pretrained"] = False
+        model_kwargs["freeze_base"] = False
 
         model = get_model(model_name, num_classes=len(class_names), **model_kwargs).to(device)
         model.load_state_dict(checkpoint_data["model_state_dict"])

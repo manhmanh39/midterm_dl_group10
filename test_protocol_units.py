@@ -238,5 +238,56 @@ class TestFailClosedProvenance(unittest.TestCase):
                     self.assertIn("FAIL CLOSED", str(ctx.exception))
 
 
+class TestModelFactoryAndReload(unittest.TestCase):
+    def test_transfer_reload_without_pretrained(self):
+        from models import get_model
+        # Phải khởi tạo được khi truyền pretrained=False, freeze_base=False
+        model = get_model("transfer", num_classes=15, backbone_name="resnet18", pretrained=False, freeze_base=False)
+        self.assertIsNotNone(model)
+        dummy = torch.randn(2, 3, 224, 224)
+        out = model(dummy)
+        self.assertEqual(out.shape, (2, 15))
+
+    def test_simple_and_complex_pop_transfer_kwargs(self):
+        from models import get_model
+        # Simple và complex không nhận pretrained/freeze_base nhưng không được ném TypeError
+        m1 = get_model("simple", num_classes=15, pretrained=False, freeze_base=False, backbone_name="resnet50")
+        m2 = get_model("complex", num_classes=15, pretrained=False, freeze_base=False, backbone_name="resnet50")
+        self.assertIsNotNone(m1)
+        self.assertIsNotNone(m2)
+
+
+class TestAccuracyMetricsDistinction(unittest.TestCase):
+    def test_per_label_vs_exact_match_accuracy(self):
+        # 2 mẫu, 3 nhãn
+        # Mẫu 1: true = [1, 0, 1], pred = [1, 0, 0] -> 2/3 nhãn đúng, exact match = 0
+        # Mẫu 2: true = [0, 0, 0], pred = [0, 0, 0] -> 3/3 nhãn đúng, exact match = 1
+        y_true = np.array([[1, 0, 1], [0, 0, 0]], dtype=np.float32)
+        y_pred = np.array([[1, 0, 0], [0, 0, 0]], dtype=np.float32)
+
+        per_label_acc = float((y_true == y_pred).mean())
+        exact_match_acc = float((y_true == y_pred).all(axis=1).mean())
+
+        self.assertAlmostEqual(per_label_acc, 5.0 / 6.0) # 83.33%
+        self.assertAlmostEqual(exact_match_acc, 0.5)      # 50.0%
+        self.assertNotEqual(per_label_acc, exact_match_acc)
+
+    def test_per_class_table_and_macro_accuracy(self):
+        y_true = np.array([[1, 0, 1], [0, 1, 0]], dtype=np.float32)
+        y_prob = np.array([[0.8, 0.2, 0.9], [0.1, 0.7, 0.3]], dtype=np.float32)
+        thresholds = np.array([0.5, 0.5, 0.5], dtype=np.float32)
+        names = ["A", "B", "No Finding"]
+
+        table = compute_per_class_table(y_true, y_prob, thresholds, names)
+        self.assertIn("accuracy_fixed", table[0])
+        self.assertIn("accuracy_calibrated", table[0])
+        self.assertEqual(table[0]["accuracy_fixed"], 1.0)
+
+        macro = compute_macro_metrics(table)
+        self.assertIn("macro_accuracy_14_fixed", macro)
+        self.assertIn("macro_accuracy_14_calibrated", macro)
+        self.assertEqual(macro["macro_accuracy_14_fixed"], 1.0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

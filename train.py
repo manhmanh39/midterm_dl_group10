@@ -1,4 +1,16 @@
+"""
+train.py - Huấn luyện mô hình thuần túy, lưu Best Checkpoint và Lưu Lịch sử Huấn luyện (Training History).
+Hỗ trợ:
+  - P0.4: Phân định rõ siêu tham số transfer learning
+  - P0.5: Đo lường chính xác đồng thời Exact Match Accuracy và Per-Label Accuracy
+  - P0.6: Lưu đầy đủ History epoch-by-epoch vào JSON và CSV
+  - P0.7: Đóng gói Provenance đầy đủ (Commit, Dirty check, Dataset Fingerprint, Hyperparameters)
+"""
+
 import argparse
+import csv
+from datetime import datetime
+import json
 from pathlib import Path
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -39,21 +51,32 @@ def _build_scheduler(optimizer, epochs: int):
     return CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
 
 
-def _compute_batch_metrics(outputs: torch.Tensor, labels: torch.Tensor) -> Tuple[int, int]:
+def _compute_batch_metrics(outputs: torch.Tensor, labels: torch.Tensor) -> Tuple[int, int, int, int]:
+    """
+    P0.5: Tính toán song song:
+      1. Per-label accuracy: Đúng từng phần tử nhãn trên toàn bộ nhãn (tp + tn) / (num_classes * batch_size)
+      2. Exact-match accuracy: Toàn bộ 15 nhãn của một mẫu phải khớp 100%
+    """
     if config.IS_MULTILABEL:
         preds = (torch.sigmoid(outputs) >= config.MULTILABEL_THRESHOLD).float()
-        correct = (preds == labels).sum().item()
-        total = labels.numel()
+        per_label_correct = (preds == labels).sum().item()
+        total_labels = labels.numel()
+        exact_match_correct = (preds == labels).all(dim=1).sum().item()
+        total_samples = labels.size(0)
     else:
         _, preds = torch.max(outputs, 1)
-        correct = (preds == labels).sum().item()
-        total = labels.size(0)
-    return correct, total
+        per_label_correct = (preds == labels).sum().item()
+        total_labels = labels.size(0)
+        exact_match_correct = per_label_correct
+        total_samples = total_labels
+    return per_label_correct, total_labels, exact_match_correct, total_samples
 
 
-def train_one_epoch(model, loader, criterion, optimizer, device) -> Tuple[float, float]:
+def train_one_epoch(model, loader, criterion, optimizer, device) -> Tuple[float, float, float]:
     model.train()
-    running_loss, correct, total = 0.0, 0, 0
+    running_loss = 0.0
+    c_label, t_label = 0, 0
+    c_exact, t_exact = 0, 0
 
     pbar = tqdm(loader, desc="  [Train]", leave=False)
     for images, labels in pbar:
@@ -68,18 +91,24 @@ def train_one_epoch(model, loader, criterion, optimizer, device) -> Tuple[float,
 
         bs = images.size(0)
         running_loss += loss.item() * bs
-        c, t = _compute_batch_metrics(outputs, labels)
-        correct += c
-        total += t
+        c_lbl, t_lbl, c_ex, t_ex = _compute_batch_metrics(outputs, labels)
+        c_label += c_lbl
+        t_label += t_lbl
+        c_exact += c_ex
+        t_exact += t_ex
         pbar.set_postfix({"loss": f"{loss.item():.4f}"})
 
     n = max(1, len(loader.dataset))
-    return running_loss / n, correct / total
+    per_label_acc = c_label / max(1, t_label)
+    exact_match_acc = c_exact / max(1, t_exact)
+    return running_loss / n, per_label_acc, exact_match_acc
 
 
-def validate_one_epoch(model, loader, criterion, device) -> Tuple[float, float, float]:
+def validate_one_epoch(model, loader, criterion, device) -> Tuple[float, float, float, float]:
     model.eval()
-    running_loss, correct, total = 0.0, 0, 0
+    running_loss = 0.0
+    c_label, t_label = 0, 0
+    c_exact, t_exact = 0, 0
     all_probs, all_labels = [], []
 
     with torch.no_grad():
@@ -90,16 +119,20 @@ def validate_one_epoch(model, loader, criterion, device) -> Tuple[float, float, 
             loss = criterion(outputs, labels)
 
             running_loss += loss.item() * images.size(0)
-            c, t = _compute_batch_metrics(outputs, labels)
-            correct += c
-            total += t
+            c_lbl, t_lbl, c_ex, t_ex = _compute_batch_metrics(outputs, labels)
+            c_label += c_lbl
+            t_label += t_lbl
+            c_exact += c_ex
+            t_exact += t_ex
 
             if config.IS_MULTILABEL:
                 all_probs.append(torch.sigmoid(outputs).cpu().numpy())
                 all_labels.append(labels.cpu().numpy())
 
     n = max(1, len(loader.dataset))
-    val_loss, val_acc = running_loss / n, correct / total
+    val_loss = running_loss / n
+    val_per_label_acc = c_label / max(1, t_label)
+    val_exact_match_acc = c_exact / max(1, t_exact)
 
     val_auc = float("nan")
     if config.IS_MULTILABEL and all_probs:
@@ -110,7 +143,7 @@ def validate_one_epoch(model, loader, criterion, device) -> Tuple[float, float, 
         except ValueError:
             val_auc = float("nan")
 
-    return val_loss, val_acc, val_auc
+    return val_loss, val_per_label_acc, val_exact_match_acc, val_auc
 
 
 def train(
@@ -130,8 +163,7 @@ def train(
     **kwargs: Any,
 ) -> Path:
     """
-    Huấn luyện mô hình thuần túy và lưu Checkpoint tốt nhất theo Validation Metric.
-    Trả về đường dẫn tới file best checkpoint (best.pth).
+    Huấn luyện mô hình thuần túy, lưu Checkpoint tốt nhất và Lưu Toàn Bộ History.
     """
     if "optimizer_name" in kwargs:
         optimizer = kwargs["optimizer_name"]
@@ -155,6 +187,10 @@ def train(
     print(f"Multi-label: {config.IS_MULTILABEL} | Device: {device}")
     print("=" * 75)
 
+    dataset_meta = compute_dataset_fingerprint(data_dir=data_dir)
+    if not dataset_meta["is_demo_data"] and git_worktree_is_dirty():
+        raise RuntimeError("[FAIL CLOSED] Working tree của Git đang có thay đổi chưa commit!")
+
     train_loader, val_loader, _, class_names, pos_weight = get_dataloaders(
         data_dir=data_dir, batch_size=batch_size, seed=seed
     )
@@ -163,6 +199,7 @@ def train(
     is_transfer = model_name.lower().strip() in ("transfer", "model3", "base")
     if is_transfer:
         model_kwargs["backbone_name"] = backbone_name
+        model_kwargs["pretrained"] = True
         model_kwargs["freeze_base"] = True
     if dropout is not None:
         model_kwargs["dropout"] = dropout
@@ -188,9 +225,9 @@ def train(
     best_epoch = 1
 
     best_checkpoint_path = save_dir / "best.pth"
-    dataset_meta = compute_dataset_fingerprint(data_dir=data_dir)
 
     start_time = time.time()
+    history_records: List[Dict[str, Any]] = []
 
     for epoch in range(1, epochs + 1):
         epoch_start = time.time()
@@ -206,8 +243,12 @@ def train(
             )
             scheduler = _build_scheduler(optimizer_obj, epochs - epoch + 1)
 
-        train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer_obj, device)
-        val_loss, val_acc, val_auc = validate_one_epoch(model, val_loader, criterion, device)
+        train_loss, train_per_label_acc, train_exact_acc = train_one_epoch(
+            model, train_loader, criterion, optimizer_obj, device
+        )
+        val_loss, val_per_label_acc, val_exact_acc, val_auc = validate_one_epoch(
+            model, val_loader, criterion, device
+        )
 
         if isinstance(scheduler, ReduceLROnPlateau):
             scheduler.step(val_loss)
@@ -215,16 +256,33 @@ def train(
             scheduler.step()
 
         dur = time.time() - epoch_start
+        current_lr = optimizer_obj.param_groups[0]["lr"]
+
         print(
             f"Epoch [{epoch:02d}/{epochs:02d}] ({dur:.1f}s) | "
-            f"Train Loss: {train_loss:.4f} | "
-            f"Val Loss: {val_loss:.4f} - Val Acc: {val_acc*100:.2f}% - Val AUC: {val_auc:.4f}", end=""
+            f"Train Loss: {train_loss:.4f} (Per-Label: {train_per_label_acc*100:.1f}%, Exact: {train_exact_acc*100:.1f}%) | "
+            f"Val Loss: {val_loss:.4f} (Per-Label: {val_per_label_acc*100:.1f}%, Exact: {val_exact_acc*100:.1f}%) - Val AUC: {val_auc:.4f}",
+            end="",
         )
 
-        current_value = {"loss": val_loss, "acc": val_acc, "auc": val_auc}[config.BEST_METRIC]
+        # P0.6: Ghi nhận lịch sử huấn luyện
+        history_records.append({
+            "epoch": epoch,
+            "train_loss": round(train_loss, 6),
+            "train_per_label_acc": round(train_per_label_acc, 4),
+            "train_exact_match_acc": round(train_exact_acc, 4),
+            "val_loss": round(val_loss, 6),
+            "val_per_label_acc": round(val_per_label_acc, 4),
+            "val_exact_match_acc": round(val_exact_acc, 4),
+            "val_auc": round(val_auc, 4) if not np.isnan(val_auc) else None,
+            "learning_rate": current_lr,
+            "duration_sec": round(dur, 2),
+        })
+
+        current_value = {"loss": val_loss, "acc": val_per_label_acc, "auc": val_auc}[config.BEST_METRIC]
         is_better = (
-            (metric_mode == "min" and current_value < best_metric_value) or
-            (metric_mode == "max" and current_value > best_metric_value)
+            (metric_mode == "min" and current_value < best_metric_value)
+            or (metric_mode == "max" and current_value > best_metric_value)
         )
 
         if is_better or epoch == 1:
@@ -236,7 +294,8 @@ def train(
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer_obj.state_dict(),
                 "val_loss": val_loss,
-                "val_acc": val_acc,
+                "val_per_label_acc": val_per_label_acc,
+                "val_exact_match_acc": val_exact_acc,
                 "val_auc": val_auc,
                 "num_classes": len(class_names),
                 "class_names": class_names,
@@ -244,17 +303,31 @@ def train(
                 "backbone_name": backbone_name if is_transfer else None,
                 "seed": seed,
                 "best_metric": config.BEST_METRIC,
-                "optimizer": optimizer,
-                "weight_decay": weight_decay,
-                "dropout": dropout,
-                "learning_rate": learning_rate,
-                "batch_size": batch_size,
+                # P0.7: Provenance hoàn chỉnh có cấu trúc
                 "provenance": {
+                    "timestamp": datetime.now().isoformat(),
                     "git_commit": get_git_commit(),
                     "git_dirty": git_worktree_is_dirty(),
                     "dataset_fingerprint": dataset_meta["dataset_fingerprint"],
+                    "data_dir": str(dataset_meta.get("data_dir")),
                     "model_name": model_name,
                     "seed": seed,
+                    "hyperparameters": {
+                        "epochs": epochs,
+                        "batch_size": batch_size,
+                        "learning_rate": learning_rate,
+                        "optimizer": optimizer,
+                        "weight_decay": weight_decay,
+                        "dropout": dropout,
+                        "backbone_name": backbone_name if is_transfer else None,
+                        "best_metric": config.BEST_METRIC,
+                    },
+                    "dataset_checksums": {
+                        "manifest_sha256": dataset_meta.get("manifest_sha256"),
+                        "train_annotations_sha256": dataset_meta.get("train_annotations_sha256"),
+                        "val_annotations_sha256": dataset_meta.get("val_annotations_sha256"),
+                        "test_annotations_sha256": dataset_meta.get("test_annotations_sha256"),
+                    },
                 },
             }, best_checkpoint_path)
             print(f" -> [ĐÃ LƯU BEST tại: {best_checkpoint_path.name}]")
@@ -265,6 +338,34 @@ def train(
     print("-" * 75)
     print(f"Huấn luyện hoàn tất trong {total_time:.2f}s! Best Epoch: {best_epoch} (Metric: {best_metric_value:.4f})")
     print("-" * 75)
+
+    # P0.6: LƯU LỊCH SỬ HUẤN LUYỆN RA JSON VÀ CSV
+    history_json_path = save_dir / "history.json"
+    history_csv_path = save_dir / "history.csv"
+
+    with open(history_json_path, "w", encoding="utf-8") as f:
+        json.dump(history_records, f, indent=2, ensure_ascii=False)
+
+    if history_records:
+        with open(history_csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(history_records[0].keys()))
+            writer.writeheader()
+            for r in history_records:
+                writer.writerow(r)
+
+    # Copy một bản vào outputs/ với tên chuẩn: history_{model_name}_seed{seed}.csv
+    outputs_csv = config.OUTPUT_DIR / f"history_{model_name}_seed{seed}.csv"
+    outputs_json = config.OUTPUT_DIR / f"history_{model_name}_seed{seed}.json"
+    try:
+        import shutil
+        shutil.copy2(history_csv_path, outputs_csv)
+        shutil.copy2(history_json_path, outputs_json)
+    except Exception:
+        pass
+
+    print(f"[history] 💾 Đã lưu lịch sử huấn luyện ({len(history_records)} epochs) tại:")
+    print(f"  - {history_csv_path}")
+    print(f"  - {history_json_path}")
 
     return best_checkpoint_path
 

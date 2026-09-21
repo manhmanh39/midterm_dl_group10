@@ -75,6 +75,8 @@ def evaluate_frozen_model(
         model_kwargs["backbone_name"] = backbone_name
     if dropout is not None:
         model_kwargs["dropout"] = dropout
+    model_kwargs["pretrained"] = False
+    model_kwargs["freeze_base"] = False
 
     model = get_model(model_name, num_classes=num_classes, **model_kwargs).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
@@ -114,15 +116,19 @@ def evaluate_frozen_model(
     per_class_table = compute_per_class_table(y_true, y_prob, calibrated_thresholds, class_names)
     macro_metrics = compute_macro_metrics(per_class_table)
 
-    # 9. Bổ sung các chỉ số Inconsistency và Exact Match
+    # 9. Bổ sung các chỉ số Inconsistency, Exact Match, và Per-Label Accuracy
     exact_match_fixed = float((y_true == y_pred_fixed_raw).all(axis=1).mean())
     exact_match_cal = float((y_true == y_pred_cal_raw).all(axis=1).mean())
+    per_label_fixed = float((y_true == y_pred_fixed_raw).mean())
+    per_label_cal = float((y_true == y_pred_cal_raw).mean())
 
     macro_metrics.update({
         "model_name": model_name,
         "seed": seed,
         "exact_match_accuracy_fixed": round(exact_match_fixed, 4),
         "exact_match_accuracy_calibrated": round(exact_match_cal, 4),
+        "per_label_accuracy_fixed": round(per_label_fixed, 4),
+        "per_label_accuracy_calibrated": round(per_label_cal, 4),
         "contradiction_rate_raw_fixed": round(incons_fixed_raw["contradiction_rate"], 4),
         "empty_diagnosis_rate_raw_fixed": round(incons_fixed_raw["empty_diagnosis_rate"], 4),
         "total_inconsistency_rate_raw_fixed": round(incons_fixed_raw["total_inconsistency_rate"], 4),
@@ -161,6 +167,10 @@ def evaluate_frozen_model(
     print(f"  Macro-14 Average Precision (AP): {macro_metrics['macro_ap_14']} (valid={macro_metrics['valid_classes_ap_14']}/14)")
     print(f"  Macro-14 F1 (Fixed 0.5)        : {macro_metrics['macro_f1_14_fixed']}")
     print(f"  Macro-14 F1 (Calibrated T*)    : {macro_metrics['macro_f1_14_calibrated']}")
+    print(f"  Per-Label Acc (Fixed 0.5)      : {macro_metrics['per_label_accuracy_fixed']*100:.2f}%")
+    print(f"  Per-Label Acc (Calibrated T*)  : {macro_metrics['per_label_accuracy_calibrated']*100:.2f}%")
+    print(f"  Exact Match Acc (Fixed 0.5)    : {macro_metrics['exact_match_accuracy_fixed']*100:.2f}%")
+    print(f"  Exact Match Acc (Calibrated T*): {macro_metrics['exact_match_accuracy_calibrated']*100:.2f}%")
     print(f"  Mean Sens (Calibrated T*)      : {macro_metrics['mean_sensitivity_14_calibrated']}")
     print(f"  Mean Spec (Calibrated T*)      : {macro_metrics['mean_specificity_14_calibrated']}")
     print(f"  Raw Inconsistency (Fixed)      : {macro_metrics['total_inconsistency_rate_raw_fixed']*100:.2f}%")

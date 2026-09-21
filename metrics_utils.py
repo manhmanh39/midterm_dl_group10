@@ -284,6 +284,7 @@ def compute_per_class_table(
             fn = int(((y_real == 1.0) & (y_pred == 0.0)).sum())
             tn = int(((y_real == 0.0) & (y_pred == 0.0)).sum())
 
+            acc = float((tp + tn) / max(1, (tp + tn + fp + fn)))
             sens = float(tp / (tp + fn)) if pos_count > 0 else float("nan")
             spec = float(tn / (tn + fp)) if neg_count > 0 else float("nan")
 
@@ -293,10 +294,10 @@ def compute_per_class_table(
                 denom = 2 * tp + fp + fn
                 f1 = float((2.0 * tp) / denom) if denom > 0 else 0.0
 
-            return f1, sens, spec
+            return f1, sens, spec, acc
 
-        f1_fixed, sens_fixed, spec_fixed = _calc_binary_metrics(yt, pf, support_pos, support_neg)
-        f1_cal, sens_cal, spec_cal = _calc_binary_metrics(yt, pc, support_pos, support_neg)
+        f1_fixed, sens_fixed, spec_fixed, acc_fixed = _calc_binary_metrics(yt, pf, support_pos, support_neg)
+        f1_cal, sens_cal, spec_cal, acc_cal = _calc_binary_metrics(yt, pc, support_pos, support_neg)
 
         per_class_records.append({
             "class_id": c,
@@ -308,6 +309,8 @@ def compute_per_class_table(
             "optimal_threshold": round(float(calibrated_thresholds[c]), 4),
             "f1_fixed": round(f1_fixed, 4) if not np.isnan(f1_fixed) else None,
             "f1_calibrated": round(f1_cal, 4) if not np.isnan(f1_cal) else None,
+            "accuracy_fixed": round(acc_fixed, 4),
+            "accuracy_calibrated": round(acc_cal, 4),
             "sensitivity_fixed": round(sens_fixed, 4) if not np.isnan(sens_fixed) else None,
             "sensitivity_calibrated": round(sens_cal, 4) if not np.isnan(sens_cal) else None,
             "specificity_fixed": round(spec_fixed, 4) if not np.isnan(spec_fixed) else None,
@@ -337,6 +340,8 @@ def compute_macro_metrics(per_class_records: List[Dict[str, Any]]) -> Dict[str, 
     macro_ap_14, valid_ap_14 = _nanmean_with_count(pathology_records, "ap")
     macro_f1_fixed_14, valid_f1_fixed_14 = _nanmean_with_count(pathology_records, "f1_fixed")
     macro_f1_cal_14, valid_f1_cal_14 = _nanmean_with_count(pathology_records, "f1_calibrated")
+    macro_acc_fixed_14, valid_acc_fixed_14 = _nanmean_with_count(pathology_records, "accuracy_fixed")
+    macro_acc_cal_14, valid_acc_cal_14 = _nanmean_with_count(pathology_records, "accuracy_calibrated")
     mean_sens_fixed_14, valid_sens_fixed_14 = _nanmean_with_count(pathology_records, "sensitivity_fixed")
     mean_sens_cal_14, valid_sens_cal_14 = _nanmean_with_count(pathology_records, "sensitivity_calibrated")
     mean_spec_fixed_14, valid_spec_fixed_14 = _nanmean_with_count(pathology_records, "specificity_fixed")
@@ -347,6 +352,8 @@ def compute_macro_metrics(per_class_records: List[Dict[str, Any]]) -> Dict[str, 
     macro_ap_15, valid_ap_15 = _nanmean_with_count(all_records, "ap")
     macro_f1_fixed_15, valid_f1_fixed_15 = _nanmean_with_count(all_records, "f1_fixed")
     macro_f1_cal_15, valid_f1_cal_15 = _nanmean_with_count(all_records, "f1_calibrated")
+    macro_acc_fixed_15, valid_acc_fixed_15 = _nanmean_with_count(all_records, "accuracy_fixed")
+    macro_acc_cal_15, valid_acc_cal_15 = _nanmean_with_count(all_records, "accuracy_calibrated")
 
     return {
         # PRIMARY: 14 Pathologies
@@ -358,6 +365,10 @@ def compute_macro_metrics(per_class_records: List[Dict[str, Any]]) -> Dict[str, 
         "valid_classes_f1_14_fixed": valid_f1_fixed_14,
         "macro_f1_14_calibrated": round(macro_f1_cal_14, 4) if not np.isnan(macro_f1_cal_14) else None,
         "valid_classes_f1_14_calibrated": valid_f1_cal_14,
+        "macro_accuracy_14_fixed": round(macro_acc_fixed_14, 4) if not np.isnan(macro_acc_fixed_14) else None,
+        "valid_classes_accuracy_14_fixed": valid_acc_fixed_14,
+        "macro_accuracy_14_calibrated": round(macro_acc_cal_14, 4) if not np.isnan(macro_acc_cal_14) else None,
+        "valid_classes_accuracy_14_calibrated": valid_acc_cal_14,
         "mean_sensitivity_14_fixed": round(mean_sens_fixed_14, 4) if not np.isnan(mean_sens_fixed_14) else None,
         "valid_classes_sensitivity_14_fixed": valid_sens_fixed_14,
         "mean_sensitivity_14_calibrated": round(mean_sens_cal_14, 4) if not np.isnan(mean_sens_cal_14) else None,
@@ -376,4 +387,8 @@ def compute_macro_metrics(per_class_records: List[Dict[str, Any]]) -> Dict[str, 
         "valid_classes_f1_15_fixed": valid_f1_fixed_15,
         "macro_f1_15_calibrated": round(macro_f1_cal_15, 4) if not np.isnan(macro_f1_cal_15) else None,
         "valid_classes_f1_15_calibrated": valid_f1_cal_15,
+        "macro_accuracy_15_fixed": round(macro_acc_fixed_15, 4) if not np.isnan(macro_acc_fixed_15) else None,
+        "valid_classes_accuracy_15_fixed": valid_acc_fixed_15,
+        "macro_accuracy_15_calibrated": round(macro_acc_cal_15, 4) if not np.isnan(macro_acc_cal_15) else None,
+        "valid_classes_accuracy_15_calibrated": valid_acc_cal_15,
     }

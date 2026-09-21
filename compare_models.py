@@ -81,6 +81,12 @@ def generate_comparison_table(
         sens_cal_14 = compute_sample_stats([r.get("mean_sensitivity_14_calibrated") for r in test_runs])
         spec_cal_14 = compute_sample_stats([r.get("mean_specificity_14_calibrated") for r in test_runs])
 
+        # P0.5: Accuracy Metrics (Per-Label & Exact Match)
+        per_label_fixed = compute_sample_stats([r.get("per_label_accuracy_fixed") for r in test_runs])
+        per_label_cal = compute_sample_stats([r.get("per_label_accuracy_calibrated") for r in test_runs])
+        exact_match_fixed = compute_sample_stats([r.get("exact_match_accuracy_fixed") for r in test_runs])
+        exact_match_cal = compute_sample_stats([r.get("exact_match_accuracy_calibrated") for r in test_runs])
+
         # Inconsistency
         incons_raw_fixed = compute_sample_stats([r.get("total_inconsistency_rate_raw_fixed") for r in test_runs])
         incons_raw_cal = compute_sample_stats([r.get("total_inconsistency_rate_raw_calibrated") for r in test_runs])
@@ -105,6 +111,10 @@ def generate_comparison_table(
             "macro_ap_14": ap_14,
             "macro_f1_14_fixed": f1_fixed_14,
             "macro_f1_14_calibrated": f1_cal_14,
+            "per_label_accuracy_fixed": per_label_fixed,
+            "per_label_accuracy_calibrated": per_label_cal,
+            "exact_match_accuracy_fixed": exact_match_fixed,
+            "exact_match_accuracy_calibrated": exact_match_cal,
             "mean_sensitivity_14_calibrated": sens_cal_14,
             "mean_specificity_14_calibrated": spec_cal_14,
             "inconsistency_raw_fixed": incons_raw_fixed,
@@ -125,12 +135,13 @@ def generate_comparison_table(
         "> - Primary Metrics: Macro-14 Pathologies (loại trừ No Finding khỏi macro primary).",
         "> - Thống kê chất lượng: Mean ± Sample Std (ddof=1) qua các seeds độc lập.",
         "> - Inference Benchmark: Đo lường chuẩn hóa batch size 1 (Latency) và batch size 16 (Standardized Throughput).",
+        "> - Phân định rõ: Per-Label Accuracy (từng nhãn độc lập) vs Exact Match Accuracy (toàn bộ 15 nhãn đồng thời).",
         "> - Không gọi nhầm Average Precision (AP) là PR-AUC.",
         "",
         "## 1. Hiệu Năng Phân Loại Bệnh Học (14 Pathologies Primary Metrics)",
         "",
-        "| Mô hình | Số Seeds | Macro-14 ROC-AUC | Macro-14 AP | Macro-14 F1 (Fixed 0.5) | Macro-14 F1 (Calibrated T*) | Sens (Cal T*) | Spec (Cal T*) |",
-        "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+        "| Mô hình | Số Seeds | Macro-14 ROC-AUC | Macro-14 AP | Macro-14 F1 (Fixed 0.5) | Macro-14 F1 (Calibrated T*) | Per-Label Acc (Cal T*) | Exact Match Acc (Cal T*) | Sens (Cal T*) | Spec (Cal T*) |",
+        "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
     ]
 
     for model, d in aggregated_data.items():
@@ -138,6 +149,7 @@ def generate_comparison_table(
             f"| **{d['display_name']}** | {d['num_seeds']} | "
             f"{d['macro_auc_14']['str']} | {d['macro_ap_14']['str']} | "
             f"{d['macro_f1_14_fixed']['str']} | {d['macro_f1_14_calibrated']['str']} | "
+            f"{d['per_label_accuracy_calibrated']['str']} | {d['exact_match_accuracy_calibrated']['str']} | "
             f"{d['mean_sensitivity_14_calibrated']['str']} | {d['mean_specificity_14_calibrated']['str']} |"
         )
 
@@ -196,6 +208,8 @@ def generate_comparison_table(
             "macro_ap_14_std": d["macro_ap_14"]["std"],
             "macro_f1_14_fixed_mean": d["macro_f1_14_fixed"]["mean"],
             "macro_f1_14_calibrated_mean": d["macro_f1_14_calibrated"]["mean"],
+            "per_label_acc_calibrated_mean": d["per_label_accuracy_calibrated"]["mean"],
+            "exact_match_acc_calibrated_mean": d["exact_match_accuracy_calibrated"]["mean"],
             "sens_14_calibrated_mean": d["mean_sensitivity_14_calibrated"]["mean"],
             "spec_14_calibrated_mean": d["mean_specificity_14_calibrated"]["mean"],
             "inconsistency_raw_fixed_mean": d["inconsistency_raw_fixed"]["mean"],

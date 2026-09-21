@@ -1,196 +1,243 @@
-import argparse
-from pathlib import Path
-from typing import Optional
+"""
+eval.py - Đánh giá mô hình đã đóng băng (Frozen Model Evaluation) theo Giao thức P1.
+Thực thi suy luận 1-pass trên tập Test độc lập, kiểm tra chặt chẽ tính toàn vẹn (Fail-Closed Provenance),
+áp dụng song song Ngưỡng cố định (Fixed-0.5) và Ngưỡng hiệu chuẩn (Calibrated T*),
+đo lường mâu thuẫn No-Finding và báo cáo chỉ số 14 pathologies riêng biệt.
+"""
 
-import matplotlib.pyplot as plt
+import argparse
+import json
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
 import numpy as np
-from sklearn.metrics import (
-    classification_report, confusion_matrix, f1_score,
-    roc_auc_score, multilabel_confusion_matrix,
-)
 import torch
-import torch.nn as nn
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 import config
 from data_loader import get_dataloaders
 from models import get_model
+from experiment_config import (
+    DEVELOP_DIR,
+    FINAL_TEST_DIR,
+    compute_file_sha256,
+    compute_dataset_fingerprint,
+    get_git_commit,
+    git_worktree_is_dirty,
+    global_preflight_check,
+    verify_fail_closed_provenance,
+    save_final_test_artifacts,
+)
+from metrics_utils import (
+    apply_thresholds,
+    measure_no_finding_inconsistency,
+    enforce_no_finding_consistency,
+    compute_per_class_table,
+    compute_macro_metrics,
+)
 
 
-def _sensitivity_specificity(mcm: np.ndarray):
-    tn, fp, fn, tp = mcm[:, 0, 0], mcm[:, 0, 1], mcm[:, 1, 0], mcm[:, 1, 1]
-    sens = tp / np.clip(tp + fn, 1, None)
-    spec = tn / np.clip(tn + fp, 1, None)
-    return sens, spec
+def evaluate_frozen_model(
+    model_name: str,
+    checkpoint_path: Path,
+    threshold_path: Path,
+    test_loader: DataLoader,
+    class_names: List[str],
+    seed: int,
+    device: torch.device = config.DEVICE,
+    data_dir: Optional[str] = None,
+    save_artifacts: bool = True,
+) -> Dict[str, Any]:
+    """
+    Thực thi 1-pass đánh giá trên tập Test cho một mô hình đã đóng băng.
+    """
+    checkpoint_path = Path(checkpoint_path)
+    threshold_path = Path(threshold_path)
+
+    # 1. Kiểm tra Provenance nội bộ
+    dataset_meta = compute_dataset_fingerprint(data_dir=data_dir)
+    verify_fail_closed_provenance(checkpoint_path, threshold_path, dataset_meta)
+
+    # 2. Đọc threshold calibrated đã lưu
+    with open(threshold_path, "r", encoding="utf-8") as f:
+        threshold_json = json.load(f)
+    calibrated_thresholds = np.array(threshold_json["thresholds"], dtype=np.float32)
+
+    # 3. Nạp model từ frozen checkpoint
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    num_classes = checkpoint.get("num_classes", len(class_names))
+    backbone_name = checkpoint.get("backbone_name")
+    dropout = checkpoint.get("dropout")
+
+    model_kwargs: Dict[str, Any] = {}
+    if backbone_name:
+        model_kwargs["backbone_name"] = backbone_name
+    if dropout is not None:
+        model_kwargs["dropout"] = dropout
+
+    model = get_model(model_name, num_classes=num_classes, **model_kwargs).to(device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
+
+    print(f"\n[eval] 🧪 Bắt đầu 1-pass Test Inference cho {model_name.upper()} (Seed={seed})...")
+
+    # 4. Thu thập toàn bộ predictions & ground truth
+    all_probs = []
+    all_labels = []
+
+    with torch.inference_mode():
+        for images, labels in tqdm(test_loader, desc=f"  [Test {model_name}]", leave=False):
+            images = images.to(device)
+            outputs = model(images)
+            probs = torch.sigmoid(outputs)
+            all_probs.append(probs.cpu().numpy())
+            all_labels.append(labels.numpy())
+
+    y_prob = np.concatenate(all_probs, axis=0)
+    y_true = np.concatenate(all_labels, axis=0)
+
+    # 5. Phân nhánh nhị phân hóa: Fixed 0.5 vs Calibrated T*
+    fixed_thresholds = np.full(num_classes, 0.5, dtype=np.float32)
+    y_pred_fixed_raw = apply_thresholds(y_prob, fixed_thresholds)
+    y_pred_cal_raw = apply_thresholds(y_prob, calibrated_thresholds)
+
+    # 6. Đo lường mâu thuẫn No-Finding nguyên bản (Raw Inconsistency)
+    incons_fixed_raw = measure_no_finding_inconsistency(y_pred_fixed_raw)
+    incons_cal_raw = measure_no_finding_inconsistency(y_pred_cal_raw)
+
+    # 7. Áp dụng quy tắc hiệu chỉnh nhất quán No-Finding (Adjusted Consistency)
+    y_pred_fixed_adj = enforce_no_finding_consistency(y_pred_fixed_raw)
+    y_pred_cal_adj = enforce_no_finding_consistency(y_pred_cal_raw)
+
+    # 8. Tính bảng Per-Class Table & Macro Metrics
+    per_class_table = compute_per_class_table(y_true, y_prob, calibrated_thresholds, class_names)
+    macro_metrics = compute_macro_metrics(per_class_table)
+
+    # 9. Bổ sung các chỉ số Inconsistency và Exact Match
+    exact_match_fixed = float((y_true == y_pred_fixed_raw).all(axis=1).mean())
+    exact_match_cal = float((y_true == y_pred_cal_raw).all(axis=1).mean())
+
+    macro_metrics.update({
+        "model_name": model_name,
+        "seed": seed,
+        "exact_match_accuracy_fixed": round(exact_match_fixed, 4),
+        "exact_match_accuracy_calibrated": round(exact_match_cal, 4),
+        "contradiction_rate_raw_fixed": round(incons_fixed_raw["contradiction_rate"], 4),
+        "empty_diagnosis_rate_raw_fixed": round(incons_fixed_raw["empty_diagnosis_rate"], 4),
+        "total_inconsistency_rate_raw_fixed": round(incons_fixed_raw["total_inconsistency_rate"], 4),
+        "contradiction_rate_raw_calibrated": round(incons_cal_raw["contradiction_rate"], 4),
+        "empty_diagnosis_rate_raw_calibrated": round(incons_cal_raw["empty_diagnosis_rate"], 4),
+        "total_inconsistency_rate_raw_calibrated": round(incons_cal_raw["total_inconsistency_rate"], 4),
+        "total_inconsistency_rate_adjusted": 0.0,
+    })
+
+    # 10. Tạo Provenance đầy đủ
+    provenance = {
+        "git_commit": get_git_commit(),
+        "git_dirty": git_worktree_is_dirty(),
+        "dataset_fingerprint": dataset_meta["dataset_fingerprint"],
+        "checkpoint_sha256": compute_file_sha256(checkpoint_path),
+        "threshold_sha256": compute_file_sha256(threshold_path),
+        "model_name": model_name,
+        "seed": seed,
+    }
+
+    # 11. Lưu Artifacts
+    if save_artifacts:
+        save_final_test_artifacts(
+            metrics_summary=macro_metrics,
+            per_class_table=per_class_table,
+            model_name=model_name,
+            seed=seed,
+            provenance=provenance,
+        )
+
+    # In kết quả tóm tắt
+    print(f"\n{'='*70}")
+    print(f"KẾT QUẢ FINAL TEST: {model_name.upper()} (Seed={seed})")
+    print(f"{'='*70}")
+    print(f"  Macro-14 ROC-AUC              : {macro_metrics['macro_auc_14']} (valid={macro_metrics['valid_classes_auc_14']}/14)")
+    print(f"  Macro-14 Average Precision (AP): {macro_metrics['macro_ap_14']} (valid={macro_metrics['valid_classes_ap_14']}/14)")
+    print(f"  Macro-14 F1 (Fixed 0.5)        : {macro_metrics['macro_f1_14_fixed']}")
+    print(f"  Macro-14 F1 (Calibrated T*)    : {macro_metrics['macro_f1_14_calibrated']}")
+    print(f"  Mean Sens (Calibrated T*)      : {macro_metrics['mean_sensitivity_14_calibrated']}")
+    print(f"  Mean Spec (Calibrated T*)      : {macro_metrics['mean_specificity_14_calibrated']}")
+    print(f"  Raw Inconsistency (Fixed)      : {macro_metrics['total_inconsistency_rate_raw_fixed']*100:.2f}%")
+    print(f"  Raw Inconsistency (Calibrated) : {macro_metrics['total_inconsistency_rate_raw_calibrated']*100:.2f}%")
+    print(f"  Adjusted Inconsistency         : {macro_metrics['total_inconsistency_rate_adjusted']*100:.2f}% (Invariant Enforced)")
+    print(f"{'='*70}")
+
+    return macro_metrics
 
 
 def evaluate_model(
     model_name: str = "transfer",
     checkpoint_path: Optional[str] = None,
+    threshold_path: Optional[str] = None,
     data_dir: Optional[str] = None,
     batch_size: int = config.BATCH_SIZE,
-    save_plot: bool = True,
+    seed: int = config.SEED,
     device: torch.device = config.DEVICE,
-):
+    enforce_preflight: bool = True,
+) -> Dict[str, Any]:
+    """
+    Hàm entry point kiểm tra tính toàn vẹn Fail-Closed trước khi tạo DataLoader.
+    """
     if checkpoint_path is None:
-        ckpt_file = config.CHECKPOINT_DIR / f"{model_name}_best.pth"
+        ckpt_file = DEVELOP_DIR / model_name / f"seed{seed}" / "best.pth"
     else:
         ckpt_file = Path(checkpoint_path)
 
-    if not ckpt_file.exists():
-        raise FileNotFoundError(
-            f"Không tìm thấy checkpoint tại: {ckpt_file}. "
-            f"Hãy huấn luyện trước: python train.py --model {model_name}"
-        )
+    if threshold_path is None:
+        th_file = DEVELOP_DIR / model_name / f"seed{seed}" / "calibrated_thresholds.json"
+    else:
+        th_file = Path(threshold_path)
 
-    print("=" * 70)
-    print(f"BẮT ĐẦU ĐÁNH GIÁ MÔ HÌNH: {model_name.upper()}")
-    print(f"Checkpoint: {ckpt_file}")
-    print("=" * 70)
+    # GLOBAL PREFLIGHT CHECK trước khi mở Test DataLoader
+    if enforce_preflight:
+        lock_file = DEVELOP_DIR / "protocol_lock.json"
+        if lock_file.exists():
+            global_preflight_check(data_dir=data_dir, lock_file=lock_file)
+        else:
+            # Nếu chạy đơn lẻ trong debug, vẫn kiểm tra single provenance
+            dataset_meta = compute_dataset_fingerprint(data_dir=data_dir)
+            verify_fail_closed_provenance(ckpt_file, th_file, dataset_meta)
 
-    _, _, test_loader, class_names, _ = get_dataloaders(data_dir=data_dir, batch_size=batch_size)
+    # TẠO TEST DATALOADER CHỈ KHI PREFLIGHT ĐÃ PASS
+    _, _, test_loader, class_names, _ = get_dataloaders(data_dir=data_dir, batch_size=batch_size, seed=seed)
 
-    checkpoint = torch.load(ckpt_file, map_location=device, weights_only=False)
-    num_classes = checkpoint.get("num_classes", len(class_names))
-    is_multilabel = checkpoint.get("is_multilabel", config.IS_MULTILABEL)
-    backbone_name = checkpoint.get("backbone_name")
-    train_seed = checkpoint.get("seed")
-    best_metric = checkpoint.get("best_metric")
-
-    if train_seed is not None:
-        print(f"  (checkpoint được train với seed={train_seed}, chọn best theo {best_metric})")
-
-    model_kwargs = {"backbone_name": backbone_name} if backbone_name else {}
-    model = get_model(model_name, num_classes=num_classes, **model_kwargs).to(device)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.eval()
-
-    criterion = nn.BCEWithLogitsLoss() if is_multilabel else nn.CrossEntropyLoss()
-
-    total_loss = 0.0
-    all_probs, all_preds, all_labels = [], [], []
-
-    with torch.no_grad():
-        for images, labels in tqdm(test_loader, desc="[Testing]"):
-            images, labels = images.to(device), labels.to(device)
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-            total_loss += loss.item() * images.size(0)
-
-            if is_multilabel:
-                probs = torch.sigmoid(outputs)
-                preds = (probs > config.MULTILABEL_THRESHOLD).float()
-                all_probs.append(probs.cpu().numpy())
-                all_preds.append(preds.cpu().numpy())
-                all_labels.append(labels.cpu().numpy())
-            else:
-                _, preds = torch.max(outputs, 1)
-                all_preds.extend(preds.cpu().numpy())
-                all_labels.extend(labels.cpu().numpy())
-
-    test_loss = total_loss / len(test_loader.dataset)
-
-    print("\n" + "=" * 70)
-    print(f"KẾT QUẢ ĐÁNH GIÁ TRÊN TẬP TEST  (multi-label={is_multilabel})")
-    print(f"  - Test Loss: {test_loss:.4f}")
-
-    if is_multilabel:
-        y_true = np.concatenate(all_labels, axis=0)
-        y_pred = np.concatenate(all_preds, axis=0)
-        y_prob = np.concatenate(all_probs, axis=0)
-
-        exact_match_acc = (y_true == y_pred).mean()
-        f1_macro = f1_score(y_true, y_pred, average="macro", zero_division=0)
-        f1_micro = f1_score(y_true, y_pred, average="micro", zero_division=0)
-
-        mcm = multilabel_confusion_matrix(y_true, y_pred)
-        sens, spec = _sensitivity_specificity(mcm)
-
-        try:
-            auc_per_class = roc_auc_score(y_true, y_prob, average=None)
-            auc_macro = float(np.nanmean(auc_per_class))
-        except ValueError:
-            auc_per_class, auc_macro = None, float("nan")
-
-        print(f"  - Per-label Accuracy: {exact_match_acc*100:.2f}%  (tham khảo, KHÔNG dùng để chọn best model)")
-        print(f"  - F1-Macro: {f1_macro:.4f} | F1-Micro: {f1_micro:.4f}")
-        print(f"  - Mean Sensitivity: {sens.mean():.4f} | Mean Specificity: {spec.mean():.4f}")
-        print(f"  - Mean AUC-ROC: {auc_macro:.4f}")
-        print("=" * 70)
-
-        print("\n--- CHI TIẾT THEO LỚP ---")
-        for i, name in enumerate(class_names[:num_classes]):
-            auc_str = f"{auc_per_class[i]:.4f}" if auc_per_class is not None else "N/A"
-            print(f"  {name:<22} Sens={sens[i]:.3f}  Spec={spec[i]:.3f}  AUC={auc_str}")
-
-        if save_plot:
-            plot_path = config.OUTPUT_DIR / f"per_class_auc_{model_name}.png"
-            plt.figure(figsize=(10, 5))
-            xs = np.arange(num_classes)
-            values = auc_per_class if auc_per_class is not None else np.zeros(num_classes)
-            plt.bar(xs, values)
-            plt.xticks(xs, class_names[:num_classes], rotation=45, ha="right", fontsize=8)
-            plt.ylabel("AUC-ROC")
-            plt.title(f"AUC-ROC theo lớp - {model_name} (Mean={auc_macro:.3f})")
-            plt.tight_layout()
-            plt.savefig(plot_path, dpi=200)
-            plt.close()
-            print(f"[eval] Đã lưu biểu đồ AUC per-class tại: {plot_path}")
-
-        return {
-            "loss": test_loss,
-            "exact_match_accuracy": exact_match_acc,
-            "f1_macro": f1_macro,
-            "f1_micro": f1_micro,
-            "mean_sensitivity": float(sens.mean()),
-            "mean_specificity": float(spec.mean()),
-            "mean_auc": auc_macro,
-        }
-
-    all_preds = np.array(all_preds)
-    all_labels = np.array(all_labels)
-    test_accuracy = (all_preds == all_labels).mean()
-    print(f"  - Test Accuracy: {test_accuracy*100:.2f}%")
-
-    present_classes = np.unique(np.concatenate([all_labels, all_preds]))
-    target_names = [class_names[i] for i in present_classes]
-    report = classification_report(all_labels, all_preds, labels=present_classes,
-                                    target_names=target_names, digits=4, zero_division=0)
-    print("\n--- CLASSIFICATION REPORT ---")
-    print(report)
-
-    cm = confusion_matrix(all_labels, all_preds, labels=present_classes)
-    if save_plot:
-        plot_path = config.OUTPUT_DIR / f"confusion_matrix_{model_name}.png"
-        plt.figure(figsize=(10, 8))
-        plt.imshow(cm, interpolation="nearest", cmap=plt.cm.Blues)
-        plt.title(f"Confusion Matrix - {model_name} (Acc: {test_accuracy*100:.1f}%)")
-        plt.colorbar()
-        ticks = np.arange(len(target_names))
-        plt.xticks(ticks, target_names, rotation=45, ha="right", fontsize=8)
-        plt.yticks(ticks, target_names, fontsize=8)
-        thresh = cm.max() / 2.0 if cm.max() > 0 else 1.0
-        for i in range(cm.shape[0]):
-            for j in range(cm.shape[1]):
-                plt.text(j, i, format(cm[i, j], "d"), ha="center",
-                          color="white" if cm[i, j] > thresh else "black")
-        plt.ylabel("Nhãn thực tế")
-        plt.xlabel("Nhãn dự đoán")
-        plt.tight_layout()
-        plt.savefig(plot_path, dpi=200)
-        plt.close()
-        print(f"[eval] Đã lưu Confusion Matrix tại: {plot_path}")
-
-    return {"loss": test_loss, "accuracy": test_accuracy, "confusion_matrix": cm}
+    return evaluate_frozen_model(
+        model_name=model_name,
+        checkpoint_path=ckpt_file,
+        threshold_path=th_file,
+        test_loader=test_loader,
+        class_names=class_names,
+        seed=seed,
+        device=device,
+        data_dir=data_dir,
+        save_artifacts=True,
+    )
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Đánh giá mô hình phân loại X-quang VinBigData")
+    parser = argparse.ArgumentParser(description="P1 Final Test Evaluation")
     parser.add_argument("--model", type=str, default="transfer", choices=["simple", "complex", "transfer"])
+    parser.add_argument("--seed", type=int, default=config.SEED)
     parser.add_argument("--checkpoint", type=str, default=None)
+    parser.add_argument("--threshold", type=str, default=None)
     parser.add_argument("--data_dir", type=str, default=None)
-    parser.add_argument("--no_plot", action="store_true")
+    parser.add_argument("--batch_size", type=int, default=config.BATCH_SIZE)
+    parser.add_argument("--skip_preflight", action="store_true", default=False)
 
     args = parser.parse_args()
-    evaluate_model(model_name=args.model, checkpoint_path=args.checkpoint,
-                    data_dir=args.data_dir, save_plot=not args.no_plot)
+
+    evaluate_model(
+        model_name=args.model,
+        checkpoint_path=args.checkpoint,
+        threshold_path=args.threshold,
+        data_dir=args.data_dir,
+        batch_size=args.batch_size,
+        seed=args.seed,
+        enforce_preflight=not args.skip_preflight,
+    )

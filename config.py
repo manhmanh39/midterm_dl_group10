@@ -7,7 +7,11 @@ import torch
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
-PROCESSED_DATA_DIR = BASE_DIR / "data" / "processed"   # nơi download_dataset.py tải về
+PROCESSED_DATA_DIR = (
+    BASE_DIR / "data" / "dataset_202601"
+    if (BASE_DIR / "data" / "dataset_202601").exists()
+    else BASE_DIR / "data" / "processed"
+)
 CHECKPOINT_DIR = BASE_DIR / "checkpoints"
 OUTPUT_DIR = BASE_DIR / "outputs"
 
@@ -27,7 +31,7 @@ IS_MULTILABEL = True
 
 IMAGE_SIZE = (224, 224)
 BATCH_SIZE = 16
-NUM_WORKERS = 16
+NUM_WORKERS = 2
 DEFAULT_EPOCHS = 15
 LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 1e-4

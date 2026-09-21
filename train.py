@@ -1,12 +1,11 @@
 import argparse
-import time
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+import time
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
 from sklearn.metrics import roc_auc_score
 from tqdm import tqdm
@@ -15,6 +14,23 @@ import config
 from seed_utils import set_seed
 from data_loader import get_dataloaders
 from models import get_model
+from experiment_config import (
+    DEVELOP_DIR,
+    get_git_commit,
+    git_worktree_is_dirty,
+    compute_dataset_fingerprint,
+    resolve_experiment_config,
+)
+
+
+def _build_optimizer(params, optimizer_name: str, lr: float, weight_decay: float):
+    opt_type = optimizer_name.lower().strip()
+    if opt_type == "sgd":
+        return torch.optim.SGD(params, lr=lr, momentum=0.9, weight_decay=weight_decay)
+    elif opt_type in ("adamw", "adam"):
+        return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+    else:
+        raise ValueError(f"Optimizer '{optimizer_name}' không được hỗ trợ. Chọn 'adamw' hoặc 'sgd'.")
 
 
 def _build_scheduler(optimizer, epochs: int):
@@ -25,7 +41,7 @@ def _build_scheduler(optimizer, epochs: int):
 
 def _compute_batch_metrics(outputs: torch.Tensor, labels: torch.Tensor) -> Tuple[int, int]:
     if config.IS_MULTILABEL:
-        preds = (torch.sigmoid(outputs) > config.MULTILABEL_THRESHOLD).float()
+        preds = (torch.sigmoid(outputs) >= config.MULTILABEL_THRESHOLD).float()
         correct = (preds == labels).sum().item()
         total = labels.numel()
     else:
@@ -57,12 +73,11 @@ def train_one_epoch(model, loader, criterion, optimizer, device) -> Tuple[float,
         total += t
         pbar.set_postfix({"loss": f"{loss.item():.4f}"})
 
-    n = len(loader.dataset)
+    n = max(1, len(loader.dataset))
     return running_loss / n, correct / total
 
 
 def validate_one_epoch(model, loader, criterion, device) -> Tuple[float, float, float]:
-    """Trả về (val_loss, val_acc, val_auc). val_auc = nan nếu không tính được."""
     model.eval()
     running_loss, correct, total = 0.0, 0, 0
     all_probs, all_labels = [], []
@@ -83,7 +98,7 @@ def validate_one_epoch(model, loader, criterion, device) -> Tuple[float, float, 
                 all_probs.append(torch.sigmoid(outputs).cpu().numpy())
                 all_labels.append(labels.cpu().numpy())
 
-    n = len(loader.dataset)
+    n = max(1, len(loader.dataset))
     val_loss, val_acc = running_loss / n, correct / total
 
     val_auc = float("nan")
@@ -103,28 +118,55 @@ def train(
     epochs: int = config.DEFAULT_EPOCHS,
     batch_size: int = config.BATCH_SIZE,
     learning_rate: float = config.LEARNING_RATE,
-    data_dir: str = None,
-    save_dir: Path = config.CHECKPOINT_DIR,
+    optimizer: str = "adamw",
+    weight_decay: float = config.WEIGHT_DECAY,
+    dropout: Optional[float] = None,
+    data_dir: Optional[str] = None,
+    save_dir: Optional[Path] = None,
     device: torch.device = config.DEVICE,
     backbone_name: str = "resnet50",
     seed: int = config.SEED,
-) -> Dict[str, List[float]]:
+    use_tuned: bool = False,
+    **kwargs: Any,
+) -> Path:
+    """
+    Huấn luyện mô hình thuần túy và lưu Checkpoint tốt nhất theo Validation Metric.
+    Trả về đường dẫn tới file best checkpoint (best.pth).
+    """
+    if "optimizer_name" in kwargs:
+        optimizer = kwargs["optimizer_name"]
+    if "lr" in kwargs:
+        learning_rate = kwargs["lr"]
+
     set_seed(seed)
 
-    print("=" * 70)
-    print(f"BẮT ĐẦU HUẤN LUYỆN: {model_name.upper()}  (seed={seed})")
+    if save_dir is None:
+        save_dir = DEVELOP_DIR / model_name / f"seed{seed}"
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    print("=" * 75)
+    print(f"BẮT ĐẦU HUẤN LUYỆN: {model_name.upper()} (Seed={seed})")
     print(f"Tiêu chí chọn Best Model: {config.BEST_METRIC.upper()}")
-    print(f"Epochs: {epochs} | Batch: {batch_size} | LR: {learning_rate} | Multi-label: {config.IS_MULTILABEL}")
-    print("=" * 70)
+    print(
+        f"Epochs: {epochs} | Batch: {batch_size} | LR: {learning_rate:.6f} | "
+        f"Opt: {optimizer} | WD: {weight_decay:.2e} | Dropout: {dropout}"
+    )
+    print(f"Multi-label: {config.IS_MULTILABEL} | Device: {device}")
+    print("=" * 75)
 
     train_loader, val_loader, _, class_names, pos_weight = get_dataloaders(
         data_dir=data_dir, batch_size=batch_size, seed=seed
     )
 
-    model_kwargs = {}
-    is_transfer = model_name in ("transfer", "model3", "base")
+    model_kwargs: Dict[str, Any] = {}
+    is_transfer = model_name.lower().strip() in ("transfer", "model3", "base")
     if is_transfer:
-        model_kwargs = {"backbone_name": backbone_name, "freeze_base": True}
+        model_kwargs["backbone_name"] = backbone_name
+        model_kwargs["freeze_base"] = True
+    if dropout is not None:
+        model_kwargs["dropout"] = dropout
+
     model = get_model(model_name, num_classes=len(class_names), **model_kwargs).to(device)
 
     if config.IS_MULTILABEL:
@@ -133,19 +175,20 @@ def train(
     else:
         criterion = nn.CrossEntropyLoss()
 
-    optimizer = AdamW(
+    optimizer_obj = _build_optimizer(
         filter(lambda p: p.requires_grad, model.parameters()),
-        lr=learning_rate, weight_decay=config.WEIGHT_DECAY,
+        optimizer_name=optimizer,
+        lr=learning_rate,
+        weight_decay=weight_decay,
     )
-    scheduler = _build_scheduler(optimizer, epochs)
-
-    history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": [], "val_auc": []}
+    scheduler = _build_scheduler(optimizer_obj, epochs)
 
     metric_mode = "min" if config.BEST_METRIC == "loss" else "max"
     best_metric_value = float("inf") if metric_mode == "min" else float("-inf")
+    best_epoch = 1
 
-    best_checkpoint_path = save_dir / f"{model_name}_best.pth"
-    last_checkpoint_path = save_dir / f"{model_name}_last.pth"
+    best_checkpoint_path = save_dir / "best.pth"
+    dataset_meta = compute_dataset_fingerprint(data_dir=data_dir)
 
     start_time = time.time()
 
@@ -155,22 +198,21 @@ def train(
         if is_transfer and epoch == config.FREEZE_EPOCHS + 1:
             print(f"  >>> Mở khóa backbone (unfreeze) tại epoch {epoch}, LR -> {config.UNFREEZE_LR}")
             model.unfreeze_backbone()
-            optimizer = AdamW(model.parameters(), lr=config.UNFREEZE_LR, weight_decay=config.WEIGHT_DECAY)
-            scheduler = _build_scheduler(optimizer, epochs - epoch + 1)
+            optimizer_obj = _build_optimizer(
+                model.parameters(),
+                optimizer_name=optimizer,
+                lr=config.UNFREEZE_LR,
+                weight_decay=weight_decay,
+            )
+            scheduler = _build_scheduler(optimizer_obj, epochs - epoch + 1)
 
-        train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device)
+        train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer_obj, device)
         val_loss, val_acc, val_auc = validate_one_epoch(model, val_loader, criterion, device)
 
         if isinstance(scheduler, ReduceLROnPlateau):
             scheduler.step(val_loss)
         else:
             scheduler.step()
-
-        history["train_loss"].append(train_loss)
-        history["train_acc"].append(train_acc)
-        history["val_loss"].append(val_loss)
-        history["val_acc"].append(val_acc)
-        history["val_auc"].append(val_auc)
 
         dur = time.time() - epoch_start
         print(
@@ -187,79 +229,74 @@ def train(
 
         if is_better or epoch == 1:
             best_metric_value = current_value
+            best_epoch = epoch
             torch.save({
-                "epoch": epoch, "model_name": model_name,
+                "epoch": epoch,
+                "model_name": model_name,
                 "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "val_loss": val_loss, "val_acc": val_acc, "val_auc": val_auc,
-                "num_classes": len(class_names), "class_names": class_names,
+                "optimizer_state_dict": optimizer_obj.state_dict(),
+                "val_loss": val_loss,
+                "val_acc": val_acc,
+                "val_auc": val_auc,
+                "num_classes": len(class_names),
+                "class_names": class_names,
                 "is_multilabel": config.IS_MULTILABEL,
                 "backbone_name": backbone_name if is_transfer else None,
-                "seed": seed, "best_metric": config.BEST_METRIC,
+                "seed": seed,
+                "best_metric": config.BEST_METRIC,
+                "optimizer": optimizer,
+                "weight_decay": weight_decay,
+                "dropout": dropout,
+                "learning_rate": learning_rate,
+                "batch_size": batch_size,
+                "provenance": {
+                    "git_commit": get_git_commit(),
+                    "git_dirty": git_worktree_is_dirty(),
+                    "dataset_fingerprint": dataset_meta["dataset_fingerprint"],
+                    "model_name": model_name,
+                    "seed": seed,
+                },
             }, best_checkpoint_path)
-            print(f" -> [ĐÃ LƯU BEST theo {config.BEST_METRIC.upper()}]")
+            print(f" -> [ĐÃ LƯU BEST tại: {best_checkpoint_path.name}]")
         else:
             print()
 
-    torch.save({
-        "epoch": epochs, "model_name": model_name,
-        "model_state_dict": model.state_dict(),
-        "val_loss": val_loss, "val_acc": val_acc, "val_auc": val_auc,
-        "num_classes": len(class_names),
-        "is_multilabel": config.IS_MULTILABEL,
-        "backbone_name": backbone_name if is_transfer else None,
-    }, last_checkpoint_path)
-
     total_time = time.time() - start_time
-    print("-" * 70)
-    print(f"Huấn luyện hoàn tất trong {total_time:.2f}s!")
-    print(f"Best {config.BEST_METRIC.upper()}: {best_metric_value:.4f}  (tại: {best_checkpoint_path})")
-    print("-" * 70)
+    print("-" * 75)
+    print(f"Huấn luyện hoàn tất trong {total_time:.2f}s! Best Epoch: {best_epoch} (Metric: {best_metric_value:.4f})")
+    print("-" * 75)
 
-    return history
+    return best_checkpoint_path
 
-
-import json
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Huấn luyện mô hình phân loại X-quang VinBigData")
+    parser = argparse.ArgumentParser(description="Huấn luyện mô hình VinBigData")
     parser.add_argument("--model", type=str, default="transfer", choices=["simple", "complex", "transfer"])
-    parser.add_argument("--backbone", type=str, default="resnet50",
-                         choices=["resnet18", "resnet50", "mobilenet_v3", "efficientnet_b0", "convnext_tiny"])
-    parser.add_argument("--epochs", type=int, default=config.DEFAULT_EPOCHS)
+    parser.add_argument("--backbone", type=str, default="resnet50")
+    parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--optimizer", type=str, default=None, choices=["adamw", "sgd"])
+    parser.add_argument("--weight_decay", type=float, default=None)
+    parser.add_argument("--dropout", type=float, default=None)
+    parser.add_argument("--use_tuned", action="store_true", default=False)
     parser.add_argument("--data_dir", type=str, default=None)
     parser.add_argument("--seed", type=int, default=config.SEED)
 
     args = parser.parse_args()
 
-    hparam_path = config.OUTPUT_DIR / f"best_hparams_{args.model}.json"
-    final_batch_size = args.batch_size
-    final_lr = args.lr
-
-    if hparam_path.exists():
-        with open(hparam_path, "r") as f:
-            best_data = json.load(f)
-            best_params = best_data["best_params"]
-            print(f"\n[train] 🎯 Đã tìm thấy file tuning của Optuna tại: {hparam_path}")
-            print(f"[train] 📌 Các tham số tốt nhất được áp dụng tự động: {best_params}")
-            
-            if final_batch_size is None:
-                final_batch_size = best_params.get("batch_size", config.BATCH_SIZE)
-            if final_lr is None:
-                final_lr = best_params.get("lr", config.LEARNING_RATE)
-    else:
-        print(f"\n[train] ⚠️ Không tìm thấy file hparam ({hparam_path}), dùng thông số mặc định.")
-        if final_batch_size is None: final_batch_size = config.BATCH_SIZE
-        if final_lr is None: final_lr = config.LEARNING_RATE
+    resolved = resolve_experiment_config(args.model, cli_args=args, use_tuned=args.use_tuned)
 
     train(
-        model_name=args.model, 
-        epochs=args.epochs, 
-        batch_size=final_batch_size,
-        learning_rate=final_lr, 
-        data_dir=args.data_dir, 
-        backbone_name=args.backbone,
+        model_name=args.model,
+        epochs=resolved["epochs"],
+        batch_size=resolved["batch_size"],
+        learning_rate=resolved["learning_rate"],
+        optimizer=resolved["optimizer"],
+        weight_decay=resolved["weight_decay"],
+        dropout=resolved["dropout"],
+        data_dir=args.data_dir,
+        backbone_name=resolved["backbone"],
         seed=args.seed,
+        use_tuned=args.use_tuned,
     )

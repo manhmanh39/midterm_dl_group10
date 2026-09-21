@@ -9,8 +9,12 @@ from .model3 import TransferLearningModel, get_model3_transfer
 def get_model(model_name: str, num_classes: int = 15, **kwargs):
     model_name = model_name.lower().strip()
     if model_name in ("simple", "model1", "model1_simple"):
+        kwargs.pop("backbone_name", None)
+        kwargs.pop("freeze_base", None)
         return get_model1_simple(num_classes=num_classes, **kwargs)
     elif model_name in ("complex", "model2", "model2_complex"):
+        kwargs.pop("backbone_name", None)
+        kwargs.pop("freeze_base", None)
         return get_model2_complex(num_classes=num_classes, **kwargs)
     elif model_name in ("transfer", "model3", "base"):
         return get_model3_transfer(num_classes=num_classes, **kwargs)

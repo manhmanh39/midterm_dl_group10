@@ -73,7 +73,19 @@ def build_prepared_samples(
 
     results = []
     for split in ["train", "val", "test"]:
-        image_ids = manifest.get(split, [])
+        raw_ids = manifest.get(split, [])
+        if isinstance(raw_ids, list) and raw_ids:
+            image_ids = raw_ids
+        elif isinstance(raw_ids, dict):
+            image_ids = raw_ids.get("image_ids", [])
+        elif "splits" in manifest and split in manifest["splits"]:
+            image_ids = manifest["splits"][split].get("image_ids", [])
+        else:
+            image_ids = []
+
+        if not image_ids and (root / split / "images").exists():
+            image_ids = [p.stem for p in (root / split / "images").glob("*.png")]
+
         img_dir = root / split / "images"
 
         label_map = _build_split_labels(root, split, image_ids, num_classes=num_classes)

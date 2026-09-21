@@ -14,14 +14,21 @@ ENV/
 .idea/
 .DS_Store
 
-# --- Weights & Checkpoints ---
+# --- Weights, Artifacts & Checkpoints ---
 checkpoints/
 *.pth
 *.pt
-outputs/*.pth
+outputs/develop/
+outputs/final_test/
+outputs/benchmarks/
+outputs/*.json
+outputs/*.csv
+outputs/*.md
+outputs/protocol_lock.json
 
-# --- Large Datasets ---
+# --- Large Datasets & Demo ---
 data/
+demo_data/
 *.log
 wandb/
 lightning_logs/

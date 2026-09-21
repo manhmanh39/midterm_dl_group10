@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 import config
-from data_loader import get_dataloaders
+from data_loader import get_test_dataloader
 from models import get_model
 from experiment_config import (
     DEVELOP_DIR,
@@ -48,15 +48,17 @@ def evaluate_frozen_model(
     device: torch.device = config.DEVICE,
     data_dir: Optional[str] = None,
     save_artifacts: bool = True,
+    data_mode: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Thực thi 1-pass đánh giá trên tập Test cho một mô hình đã đóng băng.
     """
+    mode = data_mode if data_mode is not None else config.DEFAULT_DATA_MODE
     checkpoint_path = Path(checkpoint_path)
     threshold_path = Path(threshold_path)
 
     # 1. Kiểm tra Provenance nội bộ
-    dataset_meta = compute_dataset_fingerprint(data_dir=data_dir)
+    dataset_meta = compute_dataset_fingerprint(data_dir=data_dir, data_mode=mode)
     verify_fail_closed_provenance(checkpoint_path, threshold_path, dataset_meta)
 
     # 2. Đọc threshold calibrated đã lưu
@@ -199,10 +201,12 @@ def evaluate_model(
     seed: int = config.SEED,
     device: torch.device = config.DEVICE,
     enforce_preflight: bool = True,
+    data_mode: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Hàm entry point kiểm tra tính toàn vẹn Fail-Closed trước khi tạo DataLoader.
     """
+    mode = data_mode if data_mode is not None else config.DEFAULT_DATA_MODE
     if checkpoint_path is None:
         ckpt_file = DEVELOP_DIR / model_name / f"seed{seed}" / "best.pth"
     else:
@@ -214,7 +218,7 @@ def evaluate_model(
         th_file = Path(threshold_path)
 
     # GLOBAL PREFLIGHT CHECK TRƯỚC KHI MỞ TEST DATALOADER
-    dataset_meta = compute_dataset_fingerprint(data_dir=data_dir)
+    dataset_meta = compute_dataset_fingerprint(data_dir=data_dir, data_mode=mode)
     is_demo = dataset_meta.get("is_demo_data", True)
 
     if not is_demo:
@@ -229,20 +233,20 @@ def evaluate_model(
                 "Trên tập dữ liệu thật, Giao thức P1 yêu cầu PHẢI hoàn tất phase develop cho toàn bộ "
                 "9 thí nghiệm (3 models x 3 seeds) và đóng băng qua protocol_lock.json TRƯỚC KHI mở Final-Test DataLoader."
             )
-        global_preflight_check(data_dir=data_dir, lock_file=lock_file, enforce_clean_git=True)
+        global_preflight_check(data_dir=data_dir, lock_file=lock_file, enforce_clean_git=True, data_mode=mode)
     else:
         # Trong môi trường demo/debug data
         if enforce_preflight:
             lock_file = DEVELOP_DIR / "protocol_lock.json"
             if lock_file.exists():
-                global_preflight_check(data_dir=data_dir, lock_file=lock_file, enforce_clean_git=False)
+                global_preflight_check(data_dir=data_dir, lock_file=lock_file, enforce_clean_git=False, data_mode=mode)
             else:
                 verify_fail_closed_provenance(ckpt_file, th_file, dataset_meta)
         else:
             verify_fail_closed_provenance(ckpt_file, th_file, dataset_meta)
 
     # TẠO TEST DATALOADER CHỈ KHI PREFLIGHT ĐÃ PASS 100%
-    _, _, test_loader, class_names, _ = get_dataloaders(data_dir=data_dir, batch_size=batch_size, seed=seed)
+    test_loader, class_names = get_test_dataloader(data_dir=data_dir, data_mode=mode, batch_size=batch_size)
 
     return evaluate_frozen_model(
         model_name=model_name,
@@ -254,6 +258,7 @@ def evaluate_model(
         device=device,
         data_dir=data_dir,
         save_artifacts=True,
+        data_mode=mode,
     )
 
 
@@ -264,6 +269,7 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--threshold", type=str, default=None)
     parser.add_argument("--data_dir", type=str, default=None)
+    parser.add_argument("--data_mode", type=str, default=config.DEFAULT_DATA_MODE, choices=["real", "demo"])
     parser.add_argument("--batch_size", type=int, default=config.BATCH_SIZE)
     parser.add_argument("--skip_preflight", action="store_true", default=False)
 
@@ -274,6 +280,7 @@ if __name__ == "__main__":
         checkpoint_path=args.checkpoint,
         threshold_path=args.threshold,
         data_dir=args.data_dir,
+        data_mode=args.data_mode,
         batch_size=args.batch_size,
         seed=args.seed,
         enforce_preflight=not args.skip_preflight,

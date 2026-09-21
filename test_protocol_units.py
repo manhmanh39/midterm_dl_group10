@@ -406,7 +406,7 @@ class TestZeroBypassRealDataProtocol(unittest.TestCase):
 
         with patch("eval.compute_dataset_fingerprint", return_value={"dataset_fingerprint": "mock_fp", "is_demo_data": False}):
             with self.assertRaises(RuntimeError) as ctx:
-                evaluate_model(model_name="simple", enforce_preflight=False)
+                evaluate_model(model_name="simple", enforce_preflight=False, data_mode="real")
             self.assertIn("Giao thức cấm bỏ qua preflight", str(ctx.exception))
 
     def test_missing_lock_on_real_data_aborts(self):
@@ -419,8 +419,183 @@ class TestZeroBypassRealDataProtocol(unittest.TestCase):
             with patch("eval.compute_dataset_fingerprint", return_value={"dataset_fingerprint": "mock_fp", "is_demo_data": False}):
                 with patch("eval.DEVELOP_DIR", tmp_path):
                     with self.assertRaises(FileNotFoundError) as ctx:
-                        evaluate_model(model_name="simple", enforce_preflight=True)
+                        evaluate_model(model_name="simple", enforce_preflight=True, data_mode="real")
                     self.assertIn("Không tìm thấy file khóa giao thức bắt buộc", str(ctx.exception))
+
+
+class TestP1RegressionSuite(unittest.TestCase):
+    def test_1_develop_loader_zero_test_touch(self):
+        """P1.2: get_develop_dataloaders chỉ load train & val, tuyệt đối không chạm test/ hay test_boxes.csv."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            for sp in ["train", "val", "test"]:
+                (root / sp / "images").mkdir(parents=True)
+                (root / sp / f"{sp}_boxes.csv").write_text("image_id,class_id\nsample1,0\n")
+                from PIL import Image
+                Image.new("RGB", (32, 32)).save(root / sp / "images" / "sample1.png")
+
+            manifest = {
+                "train": ["sample1"],
+                "val": ["sample1"],
+                "test": ["sample1"],
+            }
+            (root / "manifest.json").write_text(json.dumps(manifest))
+
+            from data_loader import get_develop_dataloaders
+            # Xóa file test_boxes.csv để chứng minh nếu get_develop_dataloaders đọc test_boxes.csv nó sẽ lỗi
+            (root / "test" / "test_boxes.csv").unlink()
+            (root / "test" / "images" / "sample1.png").unlink()
+
+            train_ld, val_ld, classes, pos_w = get_develop_dataloaders(
+                data_dir=str(root), data_mode="real", batch_size=1, num_workers=0
+            )
+            self.assertIsNotNone(train_ld)
+            self.assertIsNotNone(val_ld)
+            self.assertEqual(len(train_ld.dataset), 1)
+            self.assertEqual(len(val_ld.dataset), 1)
+
+    def test_2_real_loader_fail_closed_missing_manifest(self):
+        """P1.3: Thiếu manifest.json trên dataset strict/real -> FileNotFoundError."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            from prepared_loader import build_prepared_samples
+            with self.assertRaises(FileNotFoundError) as ctx:
+                build_prepared_samples(root, splits=("train",), strict=True)
+            self.assertIn("FAIL CLOSED", str(ctx.exception))
+
+    def test_3_real_loader_fail_closed_missing_csv(self):
+        """P1.3: Thiếu split_boxes.csv trên dataset strict/real -> FileNotFoundError, không fallback ngầm."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "train" / "images").mkdir(parents=True)
+            (root / "manifest.json").write_text(json.dumps({"train": ["sample1"]}))
+            from PIL import Image
+            Image.new("RGB", (32, 32)).save(root / "train" / "images" / "sample1.png")
+
+            from prepared_loader import build_prepared_samples
+            with self.assertRaises(FileNotFoundError) as ctx:
+                build_prepared_samples(root, splits=("train",), strict=True)
+            self.assertIn("Không tìm thấy file annotations bắt buộc", str(ctx.exception))
+
+    def test_4_real_loader_fail_closed_missing_image(self):
+        """P1.3: Có trong manifest nhưng thiếu file PNG thật -> FileNotFoundError."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "train" / "images").mkdir(parents=True)
+            (root / "train" / "train_boxes.csv").write_text("image_id,class_id\nmissing_img,0\n")
+            (root / "manifest.json").write_text(json.dumps({"train": ["missing_img"]}))
+
+            from prepared_loader import build_prepared_samples
+            with self.assertRaises(FileNotFoundError) as ctx:
+                build_prepared_samples(root, splits=("train",), strict=True)
+            self.assertIn("Thiếu file ảnh", str(ctx.exception))
+
+    def test_5_real_loader_fail_closed_invalid_class_id(self):
+        """P1.3: Class ID không hợp lệ (<0 hoặc >=15) trong CSV annotations -> ValueError."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "train" / "images").mkdir(parents=True)
+            (root / "train" / "train_boxes.csv").write_text("image_id,class_id\nsample1,99\n")
+            (root / "manifest.json").write_text(json.dumps({"train": ["sample1"]}))
+            from PIL import Image
+            Image.new("RGB", (32, 32)).save(root / "train" / "images" / "sample1.png")
+
+            from prepared_loader import build_prepared_samples
+            with self.assertRaises(ValueError) as ctx:
+                build_prepared_samples(root, splits=("train",), num_classes=15, strict=True)
+            self.assertIn("class_id không hợp lệ", str(ctx.exception))
+
+    def test_6_protocol_lock_matrix_canonical_set_equality(self):
+        """P1.4: Protocol lock trên real data bắt buộc kiểm tra set equality đúng 9 cặp canonical (3x3)."""
+        import config
+        from experiment_config import generate_protocol_lock
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            with unittest.mock.patch("experiment_config.DEVELOP_DIR", root):
+                with unittest.mock.patch("experiment_config.git_worktree_is_dirty", return_value=False):
+                    with unittest.mock.patch("experiment_config.compute_dataset_fingerprint", return_value={"dataset_fingerprint": "mock_fp", "is_demo_data": False, "data_mode": "real"}):
+                        # Tạo chỉ 8 cặp hoặc sai cặp (thiếu transfer seed 202603)
+                        for m in ["simple", "complex"]:
+                            for s in [202601, 202602, 202603]:
+                                d = root / m / f"seed{s}"
+                                d.mkdir(parents=True)
+                                (d / "best.pth").write_text("dummy")
+                                (d / "calibrated_thresholds.json").write_text("{}")
+                        for s in [202601, 202602]:
+                            d = root / "transfer" / f"seed{s}"
+                            d.mkdir(parents=True)
+                            (d / "best.pth").write_text("dummy")
+                            (d / "calibrated_thresholds.json").write_text("{}")
+
+                        # Thiếu 1 cặp -> Phải báo lỗi ValueError
+                        with self.assertRaises(FileNotFoundError):
+                            generate_protocol_lock(model_names=config.CANONICAL_MODELS, seeds=config.CANONICAL_SEEDS, data_mode="real")
+
+    def test_7_threshold_calibration_unclipped_pr(self):
+        """P1.5: Calibration không được clip về [0.01, 0.99]. Ngưỡng tối ưu tự nhiên <0.01 hoặc >0.99 phải được giữ nguyên."""
+        # Tạo trường hợp threshold tối ưu rất thấp (< 0.01)
+        y_true = np.array([[1], [0], [0], [0]], dtype=np.float32)
+        y_prob = np.array([[0.005], [0.001], [0.0005], [0.0001]], dtype=np.float32)
+        res = calibrate_thresholds_from_pr_curve(y_true, y_prob, class_names=["RareClass"])
+        opt_t = res["thresholds"][0]
+        # Nếu clip thì sẽ là 0.01. Không clip thì sẽ là 0.005 (hoặc giá trị trong PR thresholds <= 0.005)
+        self.assertLess(opt_t, 0.01)
+
+    def test_8_threshold_calibration_aborts_on_abnormal_or_nonfinite(self):
+        """P1.5: Xác suất có NaN/Inf hoặc ground-truth không nhị phân phải ném ValueError ngay lập tức."""
+        # Non-finite prob
+        y_true = np.array([[1, 0], [0, 1]], dtype=np.float32)
+        y_prob_nan = np.array([[np.nan, 0.5], [0.2, 0.8]], dtype=np.float32)
+        with self.assertRaises(ValueError):
+            calibrate_thresholds_from_pr_curve(y_true, y_prob_nan)
+
+        # Non-binary target
+        y_true_non_binary = np.array([[2, 0], [0, 1]], dtype=np.float32)
+        y_prob_clean = np.array([[0.8, 0.2], [0.1, 0.9]], dtype=np.float32)
+        with self.assertRaises(ValueError):
+            calibrate_thresholds_from_pr_curve(y_true_non_binary, y_prob_clean)
+
+    def test_9_safe_macro_auc_14_empty_classes_and_caller_abort(self):
+        """P1.6: compute_safe_macro_auc trả về NaN và valid_classes=0 khi không có lớp nào hợp lệ; validate_one_epoch trên real data aborts."""
+        from metrics_utils import compute_safe_macro_auc
+        from train import validate_one_epoch
+        import torch.nn as nn
+
+        # Tất cả samples toàn 0 cho 14 classes -> Không class nào có cả positive và negative
+        y_true = np.zeros((10, 14), dtype=np.float32)
+        y_prob = np.full((10, 14), 0.5, dtype=np.float32)
+        res = compute_safe_macro_auc(y_true, y_prob, class_indices=range(14))
+        self.assertTrue(np.isnan(res["macro_auc"]))
+        self.assertEqual(res["valid_classes"], 0)
+
+        # Giả lập DataLoader với nhãn toàn 0
+        from torch.utils.data import TensorDataset, DataLoader
+        dummy_x = torch.randn(4, 3, 32, 32)
+        dummy_y = torch.zeros(4, 15, dtype=torch.float32)
+        loader = DataLoader(TensorDataset(dummy_x, dummy_y), batch_size=2)
+        dummy_model = nn.Sequential(nn.Flatten(), nn.Linear(3 * 32 * 32, 15))
+        criterion = nn.BCEWithLogitsLoss()
+
+        # Trên real data, validate_one_epoch phải abort (raise RuntimeError)
+        with self.assertRaises(RuntimeError) as ctx:
+            validate_one_epoch(dummy_model, loader, criterion, torch.device("cpu"), data_mode="real")
+        self.assertIn("0 valid classes on real data", str(ctx.exception))
+
+    def test_10_benchmark_state_dict_size_greater_than_params_for_batchnorm(self):
+        """P1.7: Với model có BatchNorm (ComplexCNN), state_dict_size_bytes phải LỚN HƠN THẬT SỰ (>) parameter_only_bytes do có buffers."""
+        from models import get_model
+        from benchmark_utils import get_model_complexity
+
+        model = get_model("complex", num_classes=15)
+        comp = get_model_complexity(model)
+
+        param_bytes = comp["parameter_only_bytes"]
+        state_bytes = comp["state_dict_size_bytes"]
+
+        self.assertGreater(state_bytes, param_bytes)
+        self.assertIn("state_dict_size_mib", comp)
+        self.assertIn("weights_size_mb", comp)
 
 
 if __name__ == "__main__":

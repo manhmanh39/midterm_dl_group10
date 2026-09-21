@@ -24,8 +24,9 @@ from tqdm import tqdm
 
 import config
 from seed_utils import set_seed
-from data_loader import get_dataloaders
+from data_loader import get_develop_dataloaders
 from models import get_model
+from metrics_utils import compute_safe_macro_auc
 from experiment_config import (
     DEVELOP_DIR,
     get_git_commit,
@@ -104,7 +105,13 @@ def train_one_epoch(model, loader, criterion, optimizer, device) -> Tuple[float,
     return running_loss / n, per_label_acc, exact_match_acc
 
 
-def validate_one_epoch(model, loader, criterion, device) -> Tuple[float, float, float, float]:
+def validate_one_epoch(
+    model: nn.Module,
+    loader: torch.utils.data.DataLoader,
+    criterion: nn.Module,
+    device: torch.device,
+    data_mode: str = config.DEFAULT_DATA_MODE,
+) -> Tuple[float, float, float, float, int]:
     model.eval()
     running_loss = 0.0
     c_label, t_label = 0, 0
@@ -135,15 +142,22 @@ def validate_one_epoch(model, loader, criterion, device) -> Tuple[float, float, 
     val_exact_match_acc = c_exact / max(1, t_exact)
 
     val_auc = float("nan")
+    valid_classes = 0
     if config.IS_MULTILABEL and all_probs:
         y_prob = np.concatenate(all_probs, axis=0)
         y_true = np.concatenate(all_labels, axis=0)
-        try:
-            val_auc = roc_auc_score(y_true, y_prob, average="macro")
-        except ValueError:
-            val_auc = float("nan")
+        safe_res = compute_safe_macro_auc(y_true, y_prob, class_indices=range(config.NO_FINDING_CLASS_ID))
+        val_auc = safe_res["macro_auc"]
+        valid_classes = safe_res["valid_classes"]
 
-    return val_loss, val_per_label_acc, val_exact_match_acc, val_auc
+        if data_mode == "real" and valid_classes == 0:
+            raise RuntimeError(
+                "[FAIL CLOSED] Validation Macro-AUC-14 has 0 valid classes on real data! Caller aborts."
+            )
+        if 0 < valid_classes < config.NO_FINDING_CLASS_ID:
+            print(f"  [Val Warning] Macro-AUC-14 tính trên {valid_classes}/{config.NO_FINDING_CLASS_ID} valid classes.")
+
+    return val_loss, val_per_label_acc, val_exact_match_acc, val_auc, valid_classes
 
 
 def train(
@@ -161,11 +175,13 @@ def train(
     seed: int = config.SEED,
     use_tuned: bool = False,
     parameter_sources: Optional[Dict[str, str]] = None,
+    data_mode: Optional[str] = None,
     **kwargs: Any,
 ) -> Path:
     """
     Huấn luyện mô hình thuần túy, lưu Checkpoint tốt nhất và Lưu Toàn Bộ History.
     """
+    mode = data_mode if data_mode is not None else config.DEFAULT_DATA_MODE
     if "optimizer_name" in kwargs:
         optimizer = kwargs["optimizer_name"]
     if "lr" in kwargs:
@@ -179,7 +195,7 @@ def train(
     save_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 75)
-    print(f"BẮT ĐẦU HUẤN LUYỆN: {model_name.upper()} (Seed={seed})")
+    print(f"BẮT ĐẦU HUẤN LUYỆN: {model_name.upper()} (Seed={seed}, DataMode={mode})")
     print(f"Tiêu chí chọn Best Model: {config.BEST_METRIC.upper()}")
     print(
         f"Epochs: {epochs} | Batch: {batch_size} | LR: {learning_rate:.6f} | "
@@ -188,12 +204,12 @@ def train(
     print(f"Multi-label: {config.IS_MULTILABEL} | Device: {device}")
     print("=" * 75)
 
-    dataset_meta = compute_dataset_fingerprint(data_dir=data_dir)
+    dataset_meta = compute_dataset_fingerprint(data_dir=data_dir, data_mode=mode)
     if not dataset_meta["is_demo_data"] and git_worktree_is_dirty():
         raise RuntimeError("[FAIL CLOSED] Working tree của Git đang có thay đổi chưa commit!")
 
-    train_loader, val_loader, _, class_names, pos_weight = get_dataloaders(
-        data_dir=data_dir, batch_size=batch_size, seed=seed
+    train_loader, val_loader, class_names, pos_weight = get_develop_dataloaders(
+        data_dir=data_dir, data_mode=mode, batch_size=batch_size, seed=seed
     )
 
     model_kwargs: Dict[str, Any] = {}
@@ -250,8 +266,8 @@ def train(
         train_loss, train_per_label_acc, train_exact_acc = train_one_epoch(
             model, train_loader, criterion, optimizer_obj, device
         )
-        val_loss, val_per_label_acc, val_exact_acc, val_auc = validate_one_epoch(
-            model, val_loader, criterion, device
+        val_loss, val_per_label_acc, val_exact_acc, val_auc, valid_classes = validate_one_epoch(
+            model, val_loader, criterion, device, data_mode=mode
         )
 
         dur = time.time() - epoch_start
@@ -273,6 +289,7 @@ def train(
             "val_per_label_acc": round(val_per_label_acc, 4),
             "val_exact_match_acc": round(val_exact_acc, 4),
             "val_auc": round(val_auc, 4) if not np.isnan(val_auc) else None,
+            "val_valid_classes": valid_classes,
             "learning_rate": current_lr,
             "backbone_frozen": bool(is_transfer and epoch <= config.FREEZE_EPOCHS),
             "duration_sec": round(dur, 2),
@@ -283,11 +300,22 @@ def train(
         else:
             scheduler.step()
 
-        current_value = {"loss": val_loss, "acc": val_per_label_acc, "auc": val_auc}[config.BEST_METRIC]
-        is_better = (
-            (metric_mode == "min" and current_value < best_metric_value)
-            or (metric_mode == "max" and current_value > best_metric_value)
-        )
+        metric_map = {
+            "loss": val_loss,
+            "acc": val_per_label_acc,
+            "auc": val_auc,
+            "macro_auc_14": val_auc,
+        }
+        current_value = metric_map[config.BEST_METRIC]
+        if np.isnan(current_value):
+            if mode == "real":
+                raise RuntimeError(f"[FAIL CLOSED] Best metric '{config.BEST_METRIC}' is NaN on real data! Caller aborts.")
+            is_better = False
+        else:
+            is_better = (
+                (metric_mode == "min" and current_value < best_metric_value)
+                or (metric_mode == "max" and current_value > best_metric_value)
+            )
 
         if is_better or epoch == 1:
             best_metric_value = current_value
@@ -301,6 +329,7 @@ def train(
                 "val_per_label_acc": val_per_label_acc,
                 "val_exact_match_acc": val_exact_acc,
                 "val_auc": val_auc,
+                "val_valid_classes": valid_classes,
                 "num_classes": len(class_names),
                 "class_names": class_names,
                 "is_multilabel": config.IS_MULTILABEL,
@@ -312,6 +341,7 @@ def train(
                     "timestamp": datetime.now().isoformat(),
                     "git_commit": get_git_commit(),
                     "git_dirty": git_worktree_is_dirty(),
+                    "data_mode": mode,
                     "dataset_fingerprint": dataset_meta["dataset_fingerprint"],
                     "data_dir": str(dataset_meta.get("data_dir")),
                     "model_name": model_name,
@@ -390,6 +420,7 @@ if __name__ == "__main__":
     parser.add_argument("--dropout", type=float, default=None)
     parser.add_argument("--use_tuned", action="store_true", default=False)
     parser.add_argument("--data_dir", type=str, default=None)
+    parser.add_argument("--data_mode", type=str, default=config.DEFAULT_DATA_MODE, choices=["real", "demo"])
     parser.add_argument("--seed", type=int, default=config.SEED)
 
     args = parser.parse_args()
@@ -408,4 +439,5 @@ if __name__ == "__main__":
         backbone_name=resolved["backbone"],
         seed=args.seed,
         use_tuned=args.use_tuned,
+        data_mode=args.data_mode,
     )

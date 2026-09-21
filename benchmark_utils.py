@@ -18,18 +18,30 @@ def get_model_complexity(model: torch.nn.Module) -> Dict[str, Any]:
     Tính toán các chỉ số độ phức tạp kiến trúc (Hằng số cố định, không aggregate std qua seed):
       - Total Params (M): Tổng số tham số (triệu)
       - Trainable Params (M): Số tham số có requires_grad
-      - Weights Size (MB): Dung lượng tensor thực tế trên bộ nhớ
+      - Parameter Only Bytes: Dung lượng tensor chỉ tính parameters
+      - State Dict Size Bytes: Dung lượng toàn bộ tensor trong state_dict (bao gồm buffers như BatchNorm running_mean, running_var)
+      - State Dict Size MiB: Dung lượng (MiB) của state_dict
+      - Weights Size MB: Alias cho State Dict Size MiB (backwards compatibility)
     """
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    weights_size_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
-    weights_size_mb = weights_size_bytes / (1024.0 * 1024.0)
+    parameter_only_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
+
+    state_dict_bytes = sum(
+        t.numel() * t.element_size()
+        for t in model.state_dict().values()
+        if torch.is_tensor(t)
+    )
+    state_dict_size_mib = state_dict_bytes / (1024.0 * 1024.0)
 
     return {
         "total_params_m": round(total_params / 1e6, 4),
         "total_params_raw": total_params,
         "trainable_params_m": round(trainable_params / 1e6, 4),
-        "weights_size_mb": round(weights_size_mb, 2),
+        "parameter_only_bytes": parameter_only_bytes,
+        "state_dict_size_bytes": state_dict_bytes,
+        "state_dict_size_mib": round(state_dict_size_mib, 2),
+        "weights_size_mb": round(state_dict_size_mib, 2),
     }
 
 

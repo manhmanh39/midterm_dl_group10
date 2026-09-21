@@ -12,12 +12,13 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Subset
 
 import config
-from data_loader import get_dataloaders
+from data_loader import get_develop_dataloaders
 from models import get_model
 from seed_utils import set_seed
+from metrics_utils import compute_safe_macro_auc
 
 
-def _quick_validate(model, loader, criterion, device):
+def _quick_validate(model, loader, criterion, device, data_mode: str = config.DEFAULT_DATA_MODE):
     model.eval()
     running_loss, n = 0.0, 0
     all_probs, all_labels = [], []
@@ -34,20 +35,23 @@ def _quick_validate(model, loader, criterion, device):
 
     y_prob = np.concatenate(all_probs, axis=0)
     y_true = np.concatenate(all_labels, axis=0)
-    try:
-        auc = roc_auc_score(y_true, y_prob, average="macro")
-    except ValueError:
-        auc = 0.0
+    safe_res = compute_safe_macro_auc(y_true, y_prob, class_indices=range(config.NO_FINDING_CLASS_ID))
+    valid_classes = safe_res["valid_classes"]
 
+    if data_mode == "real" and valid_classes == 0:
+        raise RuntimeError("[FAIL CLOSED] Optuna validation Macro-AUC-14 has 0 valid classes on real data! Caller aborts.")
+
+    auc = safe_res["macro_auc"] if valid_classes > 0 else 0.0
     return running_loss / n, auc
 
 
 def objective(
     trial: optuna.Trial,
     model_name: str,
-    data_dir: str,
+    data_dir: Optional[str],
     search_epochs: int,
     sample_ratio: float = 0.2,
+    data_mode: str = config.DEFAULT_DATA_MODE,
 ) -> float:
     set_seed(config.SEED)
 
@@ -62,8 +66,8 @@ def objective(
     dropout = trial.suggest_float("dropout", 0.2, 0.5)
 
     device = config.DEVICE
-    train_loader, val_loader, _, class_names, pos_weight = get_dataloaders(
-        data_dir=data_dir, batch_size=batch_size, seed=config.SEED
+    train_loader, val_loader, class_names, pos_weight = get_develop_dataloaders(
+        data_dir=data_dir, data_mode=data_mode, batch_size=batch_size, seed=config.SEED
     )
 
     dataset_len = len(train_loader.dataset)
@@ -118,7 +122,7 @@ def objective(
                 optimizer.step()
             scheduler.step()
 
-            _, val_auc = _quick_validate(model, val_loader, criterion, device)
+            _, val_auc = _quick_validate(model, val_loader, criterion, device, data_mode=data_mode)
             best_auc = max(best_auc, val_auc)
 
             trial.report(val_auc, epoch)
@@ -144,6 +148,7 @@ def run_search(
     search_epochs=5,
     data_dir=None,
     sample_ratio=0.2,
+    data_mode=config.DEFAULT_DATA_MODE,
 ):
     study = optuna.create_study(
         direction="maximize",
@@ -152,12 +157,12 @@ def run_search(
     )
 
     print(
-        f"[optuna] Bắt đầu quét {n_trials} trials cho model '{model_name}' "
+        f"[optuna] Bắt đầu quét {n_trials} trials cho model '{model_name}' (mode={data_mode}) "
         f"({search_epochs} epoch/trial, sử dụng {int(sample_ratio*100)}% dữ liệu train để tăng tốc)..."
     )
     study.optimize(
         lambda trial: objective(
-            trial, model_name, data_dir, search_epochs, sample_ratio
+            trial, model_name, data_dir, search_epochs, sample_ratio, data_mode=data_mode
         ),
         n_trials=n_trials,
         show_progress_bar=True,
@@ -207,6 +212,7 @@ if __name__ == "__main__":
         help="Tỷ lệ dữ liệu train dùng để quét (mặc định 0.2 = 20%)",
     )
     parser.add_argument("--data_dir", type=str, default=None)
+    parser.add_argument("--data_mode", type=str, default=config.DEFAULT_DATA_MODE, choices=["real", "demo"])
 
     args = parser.parse_args()
     run_search(
@@ -215,4 +221,5 @@ if __name__ == "__main__":
         search_epochs=args.search_epochs,
         data_dir=args.data_dir,
         sample_ratio=args.sample_ratio,
+        data_mode=args.data_mode,
     )

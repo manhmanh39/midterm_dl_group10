@@ -38,12 +38,17 @@ WEIGHT_DECAY = 1e-4
 
 MULTILABEL_THRESHOLD = 0.5
 
+DEFAULT_DATA_MODE: str = "real"
+DEMO_DATA_DIR = BASE_DIR / "demo_data"
+CANONICAL_MODELS = ("simple", "complex", "transfer")
+CANONICAL_SEEDS = (202601, 202602, 202603)
+
 LR_SCHEDULER = "cosine"
 LR_PATIENCE = 3
 
 FREEZE_EPOCHS = 3
 UNFREEZE_LR = 1e-5
-BEST_METRIC = "auc"
+BEST_METRIC = "macro_auc_14"
 SEED = 202601
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")

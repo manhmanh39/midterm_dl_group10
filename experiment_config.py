@@ -71,15 +71,31 @@ def compute_file_sha256(filepath: Optional[Path]) -> Optional[str]:
     return h.hexdigest()
 
 
-def compute_dataset_fingerprint(data_dir: Optional[str] = None) -> Dict[str, Any]:
+def compute_dataset_fingerprint(
+    data_dir: Optional[str] = None,
+    data_mode: Optional[str] = None,
+) -> Dict[str, Any]:
     """
     Tạo định danh dataset_fingerprint toàn vẹn theo chuẩn canonical representation:
       SHA256("archive=" + archive_hash + "|manifest=" + manifest_hash +
              "|train=" + train_hash + "|val=" + val_hash + "|test=" + test_hash)
+    Fail-closed khi data_mode == 'real' nếu path sai hoặc thiếu manifest/CSV.
     """
-    target_dir = Path(data_dir) if data_dir else config.PROCESSED_DATA_DIR
-    if not target_dir.exists():
-        target_dir = config.BASE_DIR / "demo_data"
+    mode = data_mode if data_mode is not None else config.DEFAULT_DATA_MODE
+    if mode not in ("real", "demo"):
+        raise ValueError(f"Invalid data_mode '{mode}'. Phải là 'real' hoặc 'demo'.")
+
+    if mode == "real":
+        target_dir = Path(data_dir) if data_dir else config.PROCESSED_DATA_DIR
+        if not target_dir.exists():
+            raise FileNotFoundError(f"[FAIL CLOSED] Thư mục dữ liệu thật không tồn tại: {target_dir}")
+        manifest_file = target_dir / "manifest.json"
+        if not manifest_file.exists():
+            raise FileNotFoundError(f"[FAIL CLOSED] Thiếu manifest.json tại: {manifest_file}")
+        is_demo = False
+    else:
+        target_dir = Path(data_dir) if data_dir else config.DEMO_DATA_DIR
+        is_demo = True
 
     # 1. Tìm source archive (nếu có zip trong data)
     archive_files = list(config.DATA_DIR.glob("*.zip")) if config.DATA_DIR.exists() else []
@@ -97,17 +113,26 @@ def compute_dataset_fingerprint(data_dir: Optional[str] = None) -> Dict[str, Any
     test_boxes = target_dir / "test" / "test_boxes.csv"
     test_hash = compute_file_sha256(test_boxes) if test_boxes.exists() else "none"
 
+    if mode == "real":
+        if manifest_hash == "none":
+            raise FileNotFoundError(f"[FAIL CLOSED] Thiếu manifest.json cho real data tại: {manifest_file}")
+        if train_hash == "none":
+            raise FileNotFoundError(f"[FAIL CLOSED] Thiếu train_boxes.csv cho real data tại: {train_boxes}")
+        if val_hash == "none":
+            raise FileNotFoundError(f"[FAIL CLOSED] Thiếu val_boxes.csv cho real data tại: {val_boxes}")
+        if test_hash == "none":
+            raise FileNotFoundError(f"[FAIL CLOSED] Thiếu test_boxes.csv cho real data tại: {test_boxes}")
+
     canonical_str = (
         f"archive={archive_hash}|manifest={manifest_hash}|"
         f"train={train_hash}|val={val_hash}|test={test_hash}"
     )
     dataset_fingerprint = hashlib.sha256(canonical_str.encode("utf-8")).hexdigest()
 
-    is_demo = ("demo_data" in str(target_dir)) or (manifest_hash == "none" and train_hash == "none")
-
     return {
         "dataset_fingerprint": dataset_fingerprint,
         "is_demo_data": is_demo,
+        "data_mode": mode,
         "data_dir": str(target_dir),
         "source_archive_sha256": archive_hash,
         "manifest_sha256": manifest_hash,
@@ -118,15 +143,21 @@ def compute_dataset_fingerprint(data_dir: Optional[str] = None) -> Dict[str, Any
 
 
 def generate_protocol_lock(
-    model_names: List[str] = ["simple", "complex", "transfer"],
-    seeds: List[int] = [202601, 202602, 202603],
+    model_names: Optional[List[str]] = None,
+    seeds: Optional[List[int]] = None,
     data_dir: Optional[str] = None,
+    data_mode: Optional[str] = None,
 ) -> Path:
     """
     Sinh file outputs/develop/protocol_lock.json khóa toàn bộ 9 bộ thí nghiệm
     sau khi phase develop hoàn tất và TRƯỚC KHI mở bất kỳ final-test nào.
+    Kiểm tra set equality đúng 9 cặp canonical (3 models x 3 seeds).
     """
-    dataset_meta = compute_dataset_fingerprint(data_dir=data_dir)
+    mode = data_mode if data_mode is not None else config.DEFAULT_DATA_MODE
+    model_names = list(model_names) if model_names is not None else list(config.CANONICAL_MODELS)
+    seeds = list(seeds) if seeds is not None else list(config.CANONICAL_SEEDS)
+
+    dataset_meta = compute_dataset_fingerprint(data_dir=data_dir, data_mode=mode)
     if not dataset_meta.get("is_demo_data", True) and git_worktree_is_dirty():
         raise RuntimeError(
             "[FAIL CLOSED] Working tree của Git đang có thay đổi chưa commit!\n"
@@ -165,11 +196,23 @@ def generate_protocol_lock(
             + "\n".join(f"  - {m}" for m in missing_items)
         )
 
+    # P1.4: Kiểm tra set equality đúng ma trận canonical 3x3
+    expected_pairs = {(m, s) for m in config.CANONICAL_MODELS for s in config.CANONICAL_SEEDS}
+    actual_pairs = {(exp["model"], exp["seed"]) for exp in experiments}
+    if mode == "real" or (len(model_names) == 3 and len(seeds) == 3):
+        if actual_pairs != expected_pairs:
+            raise ValueError(
+                f"[PROTOCOL LOCK ERROR] Thí nghiệm không khớp chính xác ma trận canonical 3x3 ({len(expected_pairs)} cặp)!\n"
+                f"  Thiếu: {sorted(list(expected_pairs - actual_pairs))}\n"
+                f"  Thừa/Lệch: {sorted(list(actual_pairs - expected_pairs))}"
+            )
+
     lock_data = {
         "protocol_version": "P1.Locked",
         "timestamp": datetime.now().isoformat(),
         "git_commit": get_git_commit(),
         "git_dirty": git_worktree_is_dirty(),
+        "data_mode": mode,
         "dataset_fingerprint": dataset_meta["dataset_fingerprint"],
         "dataset_meta": dataset_meta,
         "total_experiments": len(experiments),
@@ -187,12 +230,15 @@ def global_preflight_check(
     data_dir: Optional[str] = None,
     lock_file: Optional[Path] = None,
     enforce_clean_git: bool = False,
+    data_mode: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     GLOBAL PREFLIGHT TRƯỚC KHI MỞ TEST SET:
     Kiểm tra toàn bộ các checkpoints và thresholds đã bị khóa trong protocol_lock.json.
     Nếu bất kỳ model/seed nào thiếu hoặc bị sai lệch hash -> ABORT (FAIL CLOSED).
+    Enforce set equality đúng 9 cặp canonical trên real data.
     """
+    mode = data_mode if data_mode is not None else config.DEFAULT_DATA_MODE
     if lock_file is None:
         lock_file = DEVELOP_DIR / "protocol_lock.json"
 
@@ -207,7 +253,7 @@ def global_preflight_check(
         lock_data = json.load(f)
 
     # 1. Kiểm tra Git Clean Tree và Git Commit Match (nếu không phải demo data)
-    current_dataset_meta = compute_dataset_fingerprint(data_dir=data_dir)
+    current_dataset_meta = compute_dataset_fingerprint(data_dir=data_dir, data_mode=mode)
     is_demo = current_dataset_meta.get("is_demo_data", True)
 
     if enforce_clean_git or not is_demo:
@@ -244,6 +290,17 @@ def global_preflight_check(
     experiments = lock_data.get("experiments", [])
     if not experiments:
         raise ValueError("[FAIL CLOSED] protocol_lock.json rỗng!")
+
+    # P1.4: Set equality 9 cặp canonical trên real data
+    if mode == "real":
+        expected_pairs = {(m, s) for m in config.CANONICAL_MODELS for s in config.CANONICAL_SEEDS}
+        actual_pairs = {(exp["model"], exp["seed"]) for exp in experiments}
+        if actual_pairs != expected_pairs:
+            raise ValueError(
+                f"[FAIL CLOSED] protocol_lock.json không chứa đúng 9 cặp canonical (3 models x 3 seeds)!\n"
+                f"  Thiếu: {sorted(list(expected_pairs - actual_pairs))}\n"
+                f"  Thừa/Lệch: {sorted(list(actual_pairs - expected_pairs))}"
+            )
 
     for exp in experiments:
         ckpt_path = DEVELOP_DIR / exp["checkpoint_rel_path"]
@@ -457,6 +514,7 @@ def save_calibrated_thresholds(
         "checkpoint_sha256": ckpt_hash,
         "dataset_fingerprint": dataset_meta["dataset_fingerprint"],
         "data_dir": dataset_meta["data_dir"],
+        "data_mode": dataset_meta.get("data_mode", config.DEFAULT_DATA_MODE),
     }
 
     out_data = {

@@ -119,43 +119,49 @@ def compute_pos_weight(samples: List[Tuple[str, object]]) -> Optional[torch.Tens
     return torch.tensor(pos_weight, dtype=torch.float32)
 
 
-def get_dataloaders(
+def get_develop_dataloaders(
     data_dir: Optional[str] = None,
+    data_mode: Optional[str] = None,
     batch_size: int = config.BATCH_SIZE,
     num_workers: int = config.NUM_WORKERS,
     image_size: Tuple[int, int] = config.IMAGE_SIZE,
     seed: int = config.SEED,
-) -> Tuple[DataLoader, DataLoader, DataLoader, List[str], Optional[torch.Tensor]]:
+) -> Tuple[DataLoader, DataLoader, List[str], Optional[torch.Tensor]]:
+    """
+    Tạo DataLoaders cho giai đoạn DEVELOP (Train và Val).
+    TUYỆT ĐỐI KHÔNG đọc, truy cập hoặc nạp bất kỳ dữ liệu nào của split 'test'.
+    """
+    mode = data_mode if data_mode is not None else config.DEFAULT_DATA_MODE
     train_transform, eval_transform = get_transforms(image_size)
-    target_dir = Path(data_dir) if data_dir else config.PROCESSED_DATA_DIR
 
-    if is_prepared_dataset(target_dir):
-        print(f"[data_loader] Dùng dataset đã prepared tại: {target_dir}")
-        train_samples, val_samples, test_samples = build_prepared_samples(
-            target_dir, num_classes=config.NUM_CLASSES
+    if mode == "real":
+        target_dir = Path(data_dir) if data_dir else config.PROCESSED_DATA_DIR
+        if not target_dir.exists() or not is_prepared_dataset(target_dir):
+            raise FileNotFoundError(
+                f"[FAIL CLOSED] Real prepared dataset không tồn tại tại: {target_dir}!\n"
+                f"Giao thức cấm tự động fallback sang demo khi data_mode='real'."
+            )
+        train_samples, val_samples = build_prepared_samples(
+            target_dir, splits=("train", "val"), num_classes=config.NUM_CLASSES, strict=True
         )
+    elif mode == "demo":
+        target_dir = Path(data_dir) if data_dir else config.DEMO_DATA_DIR
+        if not target_dir.exists() or not any(target_dir.iterdir()):
+            print("[data_loader] Khởi tạo demo dataset...")
+            generate_demo_dataset(config.BASE_DIR)
+        train_samples = load_split_samples(target_dir / "train")
+        val_samples = load_split_samples(target_dir / "val")
     else:
-        legacy_dir = Path(data_dir) if data_dir else config.DATA_DIR
-        train_samples = load_split_samples(legacy_dir / "train")
-        val_samples = load_split_samples(legacy_dir / "val")
-        test_samples = load_split_samples(legacy_dir / "test")
+        raise ValueError(f"Invalid data_mode: '{mode}'. Phải là 'real' hoặc 'demo'.")
 
-        if len(train_samples) == 0:
-            print("[data_loader] Không tìm thấy dữ liệu thật. Khởi tạo demo dataset...")
-            demo_dir = generate_demo_dataset(config.BASE_DIR)
-            train_samples = load_split_samples(demo_dir / "train")
-            val_samples = load_split_samples(demo_dir / "val")
-            test_samples = load_split_samples(demo_dir / "test")
-
-    print(f"[data_loader] Train={len(train_samples)}  Val={len(val_samples)}  Test={len(test_samples)}")
+    print(f"[data_loader:develop] Train={len(train_samples)}  Val={len(val_samples)} (mode={mode})")
 
     pos_weight = compute_pos_weight(train_samples)
     if pos_weight is not None:
-        print(f"[data_loader] pos_weight (class imbalance) = {pos_weight.tolist()}")
+        print(f"[data_loader:develop] pos_weight (class imbalance) = {pos_weight.tolist()}")
 
     train_dataset = VinBigDataDataset(train_samples, transform=train_transform)
     val_dataset = VinBigDataDataset(val_samples, transform=eval_transform)
-    test_dataset = VinBigDataDataset(test_samples, transform=eval_transform)
 
     generator = get_generator(seed)
 
@@ -171,13 +177,73 @@ def get_dataloaders(
         num_workers=num_workers, pin_memory=torch.cuda.is_available(),
         worker_init_fn=seed_worker if num_workers > 0 else None,
     )
+
+    return train_loader, val_loader, config.CLASS_NAMES, pos_weight
+
+
+def get_test_dataloader(
+    data_dir: Optional[str] = None,
+    data_mode: Optional[str] = None,
+    batch_size: int = config.BATCH_SIZE,
+    num_workers: int = config.NUM_WORKERS,
+    image_size: Tuple[int, int] = config.IMAGE_SIZE,
+) -> Tuple[DataLoader, List[str]]:
+    """
+    Tạo DataLoader DUY NHẤT cho giai đoạn FINAL-TEST (Chỉ nạp split 'test').
+    Chỉ được gọi sau khi Global Preflight đã pass hoàn toàn.
+    """
+    mode = data_mode if data_mode is not None else config.DEFAULT_DATA_MODE
+    _, eval_transform = get_transforms(image_size)
+
+    if mode == "real":
+        target_dir = Path(data_dir) if data_dir else config.PROCESSED_DATA_DIR
+        if not target_dir.exists() or not is_prepared_dataset(target_dir):
+            raise FileNotFoundError(
+                f"[FAIL CLOSED] Real prepared dataset không tồn tại tại: {target_dir}!"
+            )
+        (test_samples,) = build_prepared_samples(
+            target_dir, splits=("test",), num_classes=config.NUM_CLASSES, strict=True
+        )
+    elif mode == "demo":
+        target_dir = Path(data_dir) if data_dir else config.DEMO_DATA_DIR
+        if not target_dir.exists() or not (target_dir / "test").exists():
+            print("[data_loader] Khởi tạo demo dataset...")
+            generate_demo_dataset(config.BASE_DIR)
+        test_samples = load_split_samples(target_dir / "test")
+    else:
+        raise ValueError(f"Invalid data_mode: '{mode}'. Phải là 'real' hoặc 'demo'.")
+
+    print(f"[data_loader:test] Test={len(test_samples)} (mode={mode})")
+
+    test_dataset = VinBigDataDataset(test_samples, transform=eval_transform)
     test_loader = DataLoader(
         test_dataset, batch_size=batch_size, shuffle=False,
         num_workers=num_workers, pin_memory=torch.cuda.is_available(),
         worker_init_fn=seed_worker if num_workers > 0 else None,
     )
 
-    return train_loader, val_loader, test_loader, config.CLASS_NAMES, pos_weight
+    return test_loader, config.CLASS_NAMES
+
+
+def get_dataloaders(
+    data_dir: Optional[str] = None,
+    data_mode: Optional[str] = None,
+    batch_size: int = config.BATCH_SIZE,
+    num_workers: int = config.NUM_WORKERS,
+    image_size: Tuple[int, int] = config.IMAGE_SIZE,
+    seed: int = config.SEED,
+) -> Tuple[DataLoader, DataLoader, DataLoader, List[str], Optional[torch.Tensor]]:
+    """Legacy helper kết hợp cả develop và test loader."""
+    mode = data_mode if data_mode is not None else config.DEFAULT_DATA_MODE
+    train_loader, val_loader, class_names, pos_weight = get_develop_dataloaders(
+        data_dir=data_dir, data_mode=mode, batch_size=batch_size,
+        num_workers=num_workers, image_size=image_size, seed=seed,
+    )
+    test_loader, _ = get_test_dataloader(
+        data_dir=data_dir, data_mode=mode, batch_size=batch_size,
+        num_workers=num_workers, image_size=image_size,
+    )
+    return train_loader, val_loader, test_loader, class_names, pos_weight
 
 
 if __name__ == "__main__":

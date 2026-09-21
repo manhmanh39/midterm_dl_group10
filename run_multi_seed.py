@@ -14,7 +14,7 @@ import numpy as np
 import torch
 
 import config
-from data_loader import get_dataloaders
+from data_loader import get_develop_dataloaders, get_test_dataloader
 from models import get_model
 from train import train
 from eval import evaluate_frozen_model
@@ -32,8 +32,8 @@ from experiment_config import (
 from compare_models import generate_comparison_table
 
 
-DEFAULT_SEEDS = [202601, 202602, 202603]
-DEFAULT_MODELS = ["simple", "complex", "transfer"]
+DEFAULT_SEEDS = list(config.CANONICAL_SEEDS)
+DEFAULT_MODELS = list(config.CANONICAL_MODELS)
 
 
 def run_multi_seed_develop(
@@ -41,20 +41,22 @@ def run_multi_seed_develop(
     seeds: List[int] = DEFAULT_SEEDS,
     cli_args: Optional[argparse.Namespace] = None,
     data_dir: Optional[str] = None,
+    data_mode: Optional[str] = None,
 ) -> Path:
     """
     PHASE 1 (DEVELOP): Huấn luyện toàn bộ models x seeds, calibrate trên validation,
     sinh benchmark và khóa manifest bằng protocol_lock.json.
     Tuyệt đối KHÔNG mở hoặc tạo Test DataLoader!
     """
+    mode = data_mode if data_mode is not None else config.DEFAULT_DATA_MODE
     print("\n" + "=" * 80)
-    print("      PHASE 1: MULTI-SEED DEVELOPMENT & CALIBRATION (FROZEN PROTOCOL)      ")
+    print(f"      PHASE 1: MULTI-SEED DEVELOPMENT & CALIBRATION (mode={mode})      ")
     print("=" * 80)
     print(f"Mô hình : {models}")
     print(f"Seeds   : {seeds} (Tổng cộng: {len(models) * len(seeds)} thí nghiệm)")
     print("=" * 80)
 
-    dataset_meta = compute_dataset_fingerprint(data_dir=data_dir)
+    dataset_meta = compute_dataset_fingerprint(data_dir=data_dir, data_mode=mode)
     if not dataset_meta["is_demo_data"] and git_worktree_is_dirty():
         raise RuntimeError(
             "[FAIL CLOSED] Working tree của Git đang có thay đổi chưa commit!\n"
@@ -93,12 +95,13 @@ def run_multi_seed_develop(
                 seed=seed,
                 use_tuned=resolved["use_tuned"],
                 parameter_sources=resolved.get("source"),
+                data_mode=mode,
             )
 
             # 3. Load Best Checkpoint & Calibrate on Validation Only
             print(f">>> [DEVELOP] Nạp Checkpoint {ckpt_path.name} để Calibrate Ngưỡng...")
-            _, val_loader, _, class_names, _ = get_dataloaders(
-                data_dir=data_dir, batch_size=resolved["batch_size"], seed=seed
+            _, val_loader, class_names, _ = get_develop_dataloaders(
+                data_dir=data_dir, data_mode=mode, batch_size=resolved["batch_size"], seed=seed
             )
 
             ckpt_data = torch.load(ckpt_path, map_location=device, weights_only=False)
@@ -134,7 +137,7 @@ def run_multi_seed_develop(
     print("\n" + "=" * 80)
     print("🔒 TIẾN HÀNH ĐÓNG BĂNG TOÀN BỘ CÁC THÍ NGHIỆM VÀ TẠO protocol_lock.json...")
     print("=" * 80)
-    lock_file = generate_protocol_lock(model_names=models, seeds=seeds, data_dir=data_dir)
+    lock_file = generate_protocol_lock(model_names=models, seeds=seeds, data_dir=data_dir, data_mode=mode)
     print(f"✅ ĐÃ KHÓA THÀNH CÔNG: {lock_file}")
     return lock_file
 
@@ -144,6 +147,7 @@ def run_multi_seed_final_test(
     seeds: List[int] = DEFAULT_SEEDS,
     data_dir: Optional[str] = None,
     batch_size: int = config.BATCH_SIZE,
+    data_mode: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     PHASE 2 (FINAL-TEST):
@@ -152,19 +156,19 @@ def run_multi_seed_final_test(
     3. Đánh giá tuần tự từng model và seed.
     4. Sinh bảng so sánh tổng hợp với mean ± std (ddof=1).
     """
+    mode = data_mode if data_mode is not None else config.DEFAULT_DATA_MODE
     print("\n" + "=" * 80)
-    print("      PHASE 2: GLOBAL PREFLIGHT & FINAL TEST EVALUATION (FROZEN MODELS)      ")
+    print(f"      PHASE 2: GLOBAL PREFLIGHT & FINAL TEST EVALUATION (mode={mode})      ")
     print("=" * 80)
 
     # 1. BẮT BUỘC: GLOBAL PREFLIGHT CHECK TRÊN TOÀN BỘ 9 THÍ NGHIỆM
     print(">>> [FINAL-TEST] Kiểm tra Preflight toàn bộ artifacts trước khi tạo DataLoader...")
     lock_file = DEVELOP_DIR / "protocol_lock.json"
-    global_preflight_check(data_dir=data_dir, lock_file=lock_file)
+    global_preflight_check(data_dir=data_dir, lock_file=lock_file, data_mode=mode, enforce_clean_git=(mode == "real"))
 
     # 2. CHỈ TẠO TEST DATALOADER SAU KHI PREFLIGHT ĐÃ PASS
     print("\n>>> [FINAL-TEST] Toàn bộ 9 thí nghiệm đã hợp lệ. Khởi tạo Test DataLoader...")
-    # Dùng seed cố định để đảm bảo data loader batch order nhất quán
-    _, _, test_loader, class_names, _ = get_dataloaders(data_dir=data_dir, batch_size=batch_size, seed=seeds[0])
+    test_loader, class_names = get_test_dataloader(data_dir=data_dir, data_mode=mode, batch_size=batch_size)
 
     device = config.DEVICE
 
@@ -212,17 +216,17 @@ if __name__ == "__main__":
     parser.add_argument("--dropout", type=float, default=None)
     parser.add_argument("--use_tuned", action="store_true", default=False)
     parser.add_argument("--data_dir", type=str, default=None)
+    parser.add_argument("--data_mode", type=str, default=config.DEFAULT_DATA_MODE, choices=["real", "demo"])
 
     args = parser.parse_args()
 
     # Guard chống Data Leakage trên Real Data
-    dataset_meta = compute_dataset_fingerprint(data_dir=args.data_dir)
-    if args.phase == "all" and not dataset_meta["is_demo_data"]:
+    if args.phase == "all" and args.data_mode == "real":
         raise ValueError(
             "\n[BẢO VỆ GIAO THỨC] CẤM dùng '--phase all' trên dataset thật để tránh rò rỉ dữ liệu test.\n"
             "Quy trình khoa học bắt buộc:\n"
-            "  1. python run_multi_seed.py --phase develop ...\n"
-            "  2. python run_multi_seed.py --phase final-test ..."
+            "  1. python run_multi_seed.py --phase develop --data_mode real ...\n"
+            "  2. python run_multi_seed.py --phase final-test --data_mode real ..."
         )
 
     if args.phase in ("develop", "all"):
@@ -231,6 +235,7 @@ if __name__ == "__main__":
             seeds=args.seeds,
             cli_args=args,
             data_dir=args.data_dir,
+            data_mode=args.data_mode,
         )
 
     if args.phase in ("final-test", "all"):
@@ -239,4 +244,5 @@ if __name__ == "__main__":
             seeds=args.seeds,
             data_dir=args.data_dir,
             batch_size=args.batch_size or config.BATCH_SIZE,
+            data_mode=args.data_mode,
         )

@@ -14,7 +14,7 @@ import numpy as np
 import torch
 
 import config
-from data_loader import get_dataloaders
+from data_loader import get_develop_dataloaders, get_test_dataloader
 from models import get_model
 from train import train
 from eval import evaluate_frozen_model
@@ -36,15 +36,17 @@ def run_develop_phase(
     cli_args: argparse.Namespace,
     seed: int = config.SEED,
     data_dir: Optional[str] = None,
+    data_mode: Optional[str] = None,
 ) -> None:
     """
     PHASE 1: DEVELOP (Độc lập hoàn toàn với Test Set)
     """
+    mode = data_mode if data_mode is not None else config.DEFAULT_DATA_MODE
     print("\n" + "=" * 80)
-    print(f"BẮT ĐẦU GIAI ĐOẠN DEVELOP (Seed = {seed})")
+    print(f"BẮT ĐẦU GIAI ĐOẠN DEVELOP (Seed = {seed}, DataMode = {mode})")
     print("=" * 80)
 
-    dataset_meta = compute_dataset_fingerprint(data_dir=data_dir)
+    dataset_meta = compute_dataset_fingerprint(data_dir=data_dir, data_mode=mode)
     print(f"[develop] Dataset Fingerprint: {dataset_meta['dataset_fingerprint']}")
     print(f"[develop] Demo Mode          : {dataset_meta['is_demo_data']}\n")
 
@@ -83,12 +85,13 @@ def run_develop_phase(
             seed=seed,
             use_tuned=cli_args.use_tuned,
             parameter_sources=resolved.get("source"),
+            data_mode=mode,
         )
 
         # 3. Nạp lại Checkpoint tốt nhất để Calibrate trên tập Validation
         print(f"\n>>> [DEVELOP] Nạp Checkpoint tốt nhất để Calibrate Ngưỡng: {ckpt_path.name}")
-        _, val_loader, _, class_names, _ = get_dataloaders(
-            data_dir=data_dir, batch_size=resolved["batch_size"], seed=seed
+        _, val_loader, class_names, _ = get_develop_dataloaders(
+            data_dir=data_dir, data_mode=mode, batch_size=resolved["batch_size"], seed=seed
         )
 
         checkpoint_data = torch.load(ckpt_path, map_location=device, weights_only=False)
@@ -133,17 +136,19 @@ def run_final_test_phase(
     seed: int = config.SEED,
     data_dir: Optional[str] = None,
     batch_size: int = config.BATCH_SIZE,
+    data_mode: Optional[str] = None,
 ) -> None:
     """
     PHASE 2: FINAL TEST (Đánh giá các mô hình đã đóng băng hoàn toàn)
     """
+    mode = data_mode if data_mode is not None else config.DEFAULT_DATA_MODE
     print("\n" + "=" * 80)
-    print(f"BẮT ĐẦU GIAI ĐOẠN FINAL TEST (Seed = {seed})")
+    print(f"BẮT ĐẦU GIAI ĐOẠN FINAL TEST (Seed = {seed}, DataMode = {mode})")
     print("=" * 80)
 
     # 1. BẮT BUỘC: GLOBAL PREFLIGHT CHECK TRƯỚC KHI MỞ TEST DATALOADER
     print(">>> [FINAL-TEST] Thực hiện Global Preflight Check trên toàn bộ artifacts đã khóa...")
-    dataset_meta = compute_dataset_fingerprint(data_dir=data_dir)
+    dataset_meta = compute_dataset_fingerprint(data_dir=data_dir, data_mode=mode)
     is_demo = dataset_meta.get("is_demo_data", True)
 
     lock_file = DEVELOP_DIR / "protocol_lock.json"
@@ -154,16 +159,16 @@ def run_final_test_phase(
                 "Trên tập dữ liệu thật, Giao thức P1 yêu cầu PHẢI hoàn tất phase develop cho toàn bộ "
                 "các thí nghiệm và đóng băng qua protocol_lock.json TRƯỚC KHI mở Final-Test DataLoader."
             )
-        global_preflight_check(data_dir=data_dir, lock_file=lock_file, enforce_clean_git=True)
+        global_preflight_check(data_dir=data_dir, lock_file=lock_file, enforce_clean_git=True, data_mode=mode)
     else:
         if lock_file.exists():
-            global_preflight_check(data_dir=data_dir, lock_file=lock_file, enforce_clean_git=False)
+            global_preflight_check(data_dir=data_dir, lock_file=lock_file, enforce_clean_git=False, data_mode=mode)
         else:
             print(">>> [FINAL-TEST] Chế độ demo: bỏ qua global preflight vì chưa có protocol_lock.json.")
 
     # 2. CHỈ TẠO TEST DATALOADER SAU KHI PREFLIGHT ĐÃ HOÀN TOÀN HỢP LỆ
     print("\n>>> [FINAL-TEST] Tạo Test DataLoader độc lập...")
-    _, _, test_loader, class_names, _ = get_dataloaders(data_dir=data_dir, batch_size=batch_size, seed=seed)
+    test_loader, class_names = get_test_dataloader(data_dir=data_dir, data_mode=mode, batch_size=batch_size)
 
     test_results = []
     device = config.DEVICE
@@ -189,6 +194,7 @@ def run_final_test_phase(
             device=device,
             data_dir=data_dir,
             save_artifacts=True,
+            data_mode=mode,
         )
         test_results.append(metrics)
 
@@ -223,19 +229,19 @@ if __name__ == "__main__":
     parser.add_argument("--dropout", type=float, default=None)
     parser.add_argument("--use_tuned", action="store_true", default=False)
     parser.add_argument("--data_dir", type=str, default=None)
+    parser.add_argument("--data_mode", type=str, default=config.DEFAULT_DATA_MODE, choices=["real", "demo"])
     parser.add_argument("--seed", type=int, default=config.SEED)
 
     args = parser.parse_args()
     selected_models = ["simple", "complex", "transfer"] if args.model == "all" else [args.model]
 
     # KHÓA BẢO VỆ CHỐNG DATA LEAKAGE TRÊN DATA THẬT
-    dataset_meta = compute_dataset_fingerprint(data_dir=args.data_dir)
-    if args.phase == "all" and not dataset_meta["is_demo_data"]:
+    if args.phase == "all" and args.data_mode == "real":
         raise ValueError(
             "\n[BẢO VỆ GIAO THỨC] CẤM dùng '--phase all' trên dataset thật để tránh rò rỉ dữ liệu test.\n"
             "Quy trình khoa học bắt buộc:\n"
-            "  1. python main.py --phase develop --model ...\n"
-            "  2. python main.py --phase final-test --model ..."
+            "  1. python main.py --phase develop --data_mode real --model ...\n"
+            "  2. python main.py --phase final-test --data_mode real --model ..."
         )
 
     if args.phase in ("develop", "all"):
@@ -244,6 +250,7 @@ if __name__ == "__main__":
             cli_args=args,
             seed=args.seed,
             data_dir=args.data_dir,
+            data_mode=args.data_mode,
         )
 
     if args.phase in ("final-test", "all"):
@@ -252,4 +259,5 @@ if __name__ == "__main__":
             seed=args.seed,
             data_dir=args.data_dir,
             batch_size=args.batch_size or config.BATCH_SIZE,
+            data_mode=args.data_mode,
         )

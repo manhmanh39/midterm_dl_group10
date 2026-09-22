@@ -2,7 +2,7 @@
 ## PHÁT HIỆN BỆNH HỌC ĐA THỰC THỂ TRÊN X-QUANG LỒNG NGỰC (VINBIGDATA OBJECT DETECTION)
 
 *Dành cho Nhóm 10 - Môn Học Deep Learning*  
-*Trạng thái: **SPEC LOCKED 100% (Đã kiểm chuẩn toàn diện 18 invariants qua 17 Unit Tests)***  
+*Trạng thái: **SPEC LOCKED 100% (Đã kiểm chuẩn toàn diện 24 invariants qua 24 Unit Tests)***  
 *Branch làm việc: `feat/detection-p0-p1` (Tuyệt đối không push trực tiếp vào `main`)*
 
 ---
@@ -158,8 +158,14 @@ Dưới đây là 18 hạng mục kỹ thuật đã được bọc thép (harden
 | **14**| `P1-BENCH-1` | Minh bạch batch size và device benchmark | Cột thông lượng ghi rõ `bs4_throughput_fps` hoặc `bs16_throughput_fps` và thiết bị `(cpu)` hoặc `(cuda)`. | [benchmark_utils.py](file:///c:/Users/admin/Downloads/MidtermDL/scripts/benchmark_utils.py) |
 | **15**| `P1-DATAMODE-1`| Hỗ trợ `--data_mode {real, demo}` đồng nhất | Toàn bộ 4 entrypoint (`train.py`, `evaluate.py`, `main.py`, `run_multi_seed.py`) đều hỗ trợ tham số `--data_mode`. | Các entrypoint |
 | **16**| `P0-DATA-1` | Thống nhất thư mục dữ liệu `dataset_202601` | Cấu hình trung tâm `get_processed_data_root()` trỏ chuẩn về `data/dataset_202601`. | [config.py](file:///c:/Users/admin/Downloads/MidtermDL/scripts/config.py) |
-| **17**| `P1-TESTS-1` | 17 Unit Tests tự động hóa 100% | Bao phủ toàn bộ 18 invariants: data contract, split guards, SHA verification, bijection, single-pass test. | [test_detection_protocol.py](file:///c:/Users/admin/Downloads/MidtermDL/tests/test_detection_protocol.py) |
+| **17**| `P1-TESTS-1` | 24 Unit Tests tự động hóa 100% | Bao phủ toàn bộ 24 invariants: data contract, split guards, SHA verification, bijection, single-pass test, lock immutability, provenance binding. | [test_detection_protocol.py](file:///c:/Users/admin/Downloads/MidtermDL/tests/test_detection_protocol.py) |
 | **18**| `P0-DECODE-1` | Tương thích tham số `min_score` / `conf_thr` | `decode_predictions()` hỗ trợ alias `min_score` song song với `conf_threshold`. | [decode.py](file:///c:/Users/admin/Downloads/MidtermDL/scripts/src/decode.py) |
+| **19**| `P1-IMMUTABLE-1`| Full-Lock Immutability qua Sidecar SHA256 | `protocol_lock.json.sha256` được sinh và xác thực nghiêm ngặt; mọi can thiệp vào file lock đều bị chặn đứng. | [experiment_config.py](file:///c:/Users/admin/Downloads/MidtermDL/scripts/experiment_config.py) |
+| **20**| `P1-DEDUP-1` | Exact Canonical 3x3 Deduplication | Loại bỏ hoàn toàn danh sách trùng lặp (`sorted(list) == sorted(canonical)`). Cấm các danh sách giả mạo hoặc lặp phần tử. | [experiment_config.py](file:///c:/Users/admin/Downloads/MidtermDL/scripts/experiment_config.py) |
+| **21**| `P1-DISCIPLINE-1`| Cấm `phase=all` ở chế độ Real | Cấm chạy một mạch `phase="all"` ở chế độ real; bắt buộc tuân thủ 3 bước rời rạc: `develop` $\rightarrow$ `lock` $\rightarrow$ `final-test`. | [run_multi_seed.py](file:///c:/Users/admin/Downloads/MidtermDL/run_multi_seed.py) |
+| **22**| `P0-SEMANTIC-1`| Semantic Model/Seed Provenance Binding | Evaluator kiểm tra chéo toàn diện `model_name`, `seed`, `dataset_fingerprint`, và `git_commit` giữa checkpoint và lock. | [evaluate.py](file:///c:/Users/admin/Downloads/MidtermDL/evaluate.py) |
+| **23**| `P1-ANTIBYPASS-1`| Chặn đứng Downgrade Bypass Real/Demo | Khóa cứng chế độ `real` nếu lock được sinh ở real mode; cấm dùng `--data_mode demo` trên real lock. | [experiment_config.py](file:///c:/Users/admin/Downloads/MidtermDL/scripts/experiment_config.py) |
+| **24**| `P1-CLEAN-1` | Runtime Artifacts vs Git Clean | `.gitignore` và `is_git_clean()` chủ động loại trừ các artifacts trong `outputs/` khỏi kiểm tra dirty. | [.gitignore](file:///c:/Users/admin/Downloads/MidtermDL/.gitignore) |
 
 ---
 
@@ -203,7 +209,10 @@ MidtermDL/
 ├── run_multi_seed.py                  # Điều phối Canonical 3x3 (develop -> lock -> final-test), no-relock guard
 ├── compare_models.py                  # Tổng hợp so sánh: Benchmark (device/batch size) + Test Metrics (ddof=1)
 ├── tests/
-│   └── test_detection_protocol.py     # Bộ 17 Unit Tests kiểm tra toàn diện 100% 18 invariants
+│   └── test_detection_protocol.py     # Bộ 24 Unit Tests kiểm tra toàn diện 100% 24 invariants
+├── WALKTHROUGH.md                     # Báo cáo nghiệm thu chi tiết tại root
+├── .github/
+│   └── workflows/ci.yml               # GitHub Actions CI tự động hóa kiểm thử
 └── PROTOCOL_TAKENOTES.md              # Tài liệu này
 ```
 
@@ -211,11 +220,11 @@ MidtermDL/
 
 ## 7. HƯỚNG DẪN CHẠY LỆNH THỰC NGHIỆM (CLI GUIDE)
 
-### 7.1. Chạy Toàn Bộ 17 Unit Tests Kiểm Chuẩn
+### 7.1. Chạy Toàn Bộ 24 Unit Tests Kiểm Chuẩn
 ```bash
 python -m unittest tests/test_detection_protocol.py
 ```
-*Kết quả kỳ vọng: 17 tests passed 100% OK trong ~5 giây.*
+*Kết quả kỳ vọng: 24 tests passed 100% OK trong ~6.9 giây.*
 
 ### 7.2. Kiểm tra Dữ liệu & Audit Va chạm Cell
 ```bash

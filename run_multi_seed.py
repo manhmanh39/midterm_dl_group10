@@ -46,6 +46,24 @@ def run_canonical_multi_seed(
 ) -> Dict:
     models = models or CANONICAL_MODELS
     seeds = seeds or CANONICAL_SEEDS
+
+    # Deduplication check
+    if len(models) != len(set(models)):
+        raise ValueError(f"Duplicate model in models: {models}")
+    if len(seeds) != len(set(seeds)):
+        raise ValueError(f"Duplicate seed in seeds: {seeds}")
+
+    # Forbid phase='all' in real mode
+    if phase == "all" and data_mode == "real":
+        raise ValueError(
+            "GIAO THUC CANONICAL: O che do 'real', cam tuyet doi chay '--phase all' mot mach!\n"
+            "Quy trinh bat buoc phai tuan thu 3 buoc ro rang voi khoang dung kiem dinh:\n"
+            "  Buoc 1: python run_multi_seed.py --model all --phase develop --data_mode real\n"
+            "  Buoc 2: python run_multi_seed.py --model all --phase lock --data_mode real\n"
+            "  Buoc 3: python run_multi_seed.py --model all --phase final-test --data_mode real\n"
+            "Co '--phase all' chi danh rieng cho data_mode='demo' de phuc vu smoke testing tu dong."
+        )
+
     data_root = data_root or get_processed_data_root()
     os.makedirs(output_dir, exist_ok=True)
     lock_path = os.path.join(output_dir, "protocol_lock.json")
@@ -128,6 +146,7 @@ def run_canonical_multi_seed(
                     lock_token=permit,
                     lock_path=lock_path,
                     output_dir=output_dir,
+                    data_mode=data_mode,
                 )
                 scalar_metrics = {k: v for k, v in metrics.items() if not isinstance(v, list)}
                 scalar_metrics["seed"] = s

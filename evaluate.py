@@ -55,6 +55,7 @@ def evaluate_model(
     lock_token: Optional[Union[str, PreflightPermit]] = None,
     lock_path: str = "outputs/protocol_lock.json",
     output_dir: str = "outputs",
+    data_mode: str = "real",
 ) -> Dict:
     """
     Danh gia Test Set dung 1 pass duy nhat (1 traversal qua TestLoader).
@@ -68,46 +69,89 @@ def evaluate_model(
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint khong ton tai: {checkpoint_path}")
 
+    lock_file = Path(lock_path)
+    if not lock_file.is_file():
+        raise RuntimeError(
+            f"SECURITY ALERT (P1 Blocker): Protocol lock khong ton tai tai: {lock_file}!\n"
+            f"Evaluator trong giai doan final-test bat buoc phai co protocol_lock.json da duoc preflight."
+        )
+
+    # 0. Kiem tra Full-Lock Immutability qua Sidecar SHA256
+    sidecar_p = lock_file.parent / f"{lock_file.name}.sha256"
+    if not sidecar_p.is_file():
+        raise RuntimeError(
+            f"SECURITY ALERT (P1 Blocker): Sidecar SHA256 bi thieu cho file lock tai: {sidecar_p}!"
+        )
+    disk_lock_sha = compute_file_sha256(lock_file)
+    if sidecar_p.read_text(encoding="utf-8").strip().split()[0] != disk_lock_sha:
+        raise RuntimeError(
+            f"SECURITY ALERT (P1 Blocker): Protocol lock immutability violated! File {lock_file} da bi sua doi."
+        )
+
+    lock_data = json.loads(lock_file.read_text(encoding="utf-8"))
+    if lock_data.get("data_mode") == "real" and data_mode == "demo":
+        raise ValueError("Khong the evaluate voi data_mode='demo' khi protocol duoc khoa o che do 'real'!")
+
+    if isinstance(lock_token, PreflightPermit):
+        if lock_token.lock_sha256 != disk_lock_sha:
+            raise RuntimeError("PreflightPermit khong khop voi disk SHA cua protocol_lock.json hien tai!")
+
     # 1. Enforce Checkpoint thuoc Lock & tinh toan disk SHA
     disk_sha = compute_file_sha256(checkpoint_path)
-    lock_file = Path(lock_path)
-    if lock_file.is_file():
-        lock_data = json.loads(lock_file.read_text(encoding="utf-8"))
-        registered_checkpoints = {
-            info["sha256"]: (k, info) for k, info in lock_data.get("checkpoints", {}).items()
-        }
-        if disk_sha not in registered_checkpoints:
-            raise RuntimeError(
-                f"SECURITY ALERT (P1 Blocker): Checkpoint '{checkpoint_path}' (SHA: {disk_sha[:16]}...) "
-                f"KHONG thuoc danh sach 9 checkpoints da khoa trong {lock_path}!\n"
-                f"Final-Test chi chap nhan checkpoint da qua preflight va duoc dang ky trong protocol_lock.json."
-            )
-        entry_key, entry_info = registered_checkpoints[disk_sha]
-        if entry_info["model"] != model_name:
-            raise RuntimeError(
-                f"Model mismatch trong lock: entry yeu cau model '{entry_info['model']}', nhung goi voi '{model_name}'"
-            )
+    registered_checkpoints = {
+        info["sha256"]: (k, info) for k, info in lock_data.get("checkpoints", {}).items()
+    }
+    if disk_sha not in registered_checkpoints:
+        raise RuntimeError(
+            f"SECURITY ALERT (P1 Blocker): Checkpoint '{checkpoint_path}' (SHA: {disk_sha[:16]}...) "
+            f"KHONG thuoc danh sach 9 checkpoints da khoa trong {lock_path}!\n"
+            f"Final-Test chi chap nhan checkpoint da qua preflight va duoc dang ky trong protocol_lock.json."
+        )
+    entry_key, entry_info = registered_checkpoints[disk_sha]
+    if entry_info["model"] != model_name:
+        raise RuntimeError(
+            f"Model mismatch trong lock: entry yeu cau model '{entry_info['model']}', nhung goi voi '{model_name}'"
+        )
 
-        # 2. Enforce Evaluation Config tu Lock (Overriding CLI flags)
-        locked_eval_cfg = lock_data.get("evaluation_config", {})
-        conf_threshold = locked_eval_cfg.get("baseline_conf_threshold", CONF_THRESHOLD)
-        nms_iou_threshold = locked_eval_cfg.get("baseline_nms_iou", NMS_IOU_THRESHOLD)
-        match_iou_threshold = locked_eval_cfg.get("match_iou_threshold", 0.5)
-        min_score = locked_eval_cfg.get("eval_min_score", 0.01)
-        image_size = locked_eval_cfg.get("image_size", image_size)
-        max_det = locked_eval_cfg.get("max_det", MAX_DET)
-        print(f"[evaluate] Enforcing locked evaluation config tu {lock_path}:")
-        print(f"  conf_threshold={conf_threshold}, nms_iou={nms_iou_threshold}, min_score={min_score}, max_det={max_det}")
-    else:
-        # Fallback cho standalone test khi khong co lock_file (se bi chan boi split guard neu khong co token)
-        conf_threshold = conf_threshold if conf_threshold is not None else CONF_THRESHOLD
-        nms_iou_threshold = nms_iou_threshold if nms_iou_threshold is not None else NMS_IOU_THRESHOLD
-        match_iou_threshold = match_iou_threshold if match_iou_threshold is not None else 0.5
-        min_score = min_score if min_score is not None else 0.01
-        max_det = MAX_DET
+    # 2. Enforce Evaluation Config tu Lock (Overriding CLI flags)
+    locked_eval_cfg = lock_data.get("evaluation_config", {})
+    conf_threshold = locked_eval_cfg.get("baseline_conf_threshold", CONF_THRESHOLD)
+    nms_iou_threshold = locked_eval_cfg.get("baseline_nms_iou", NMS_IOU_THRESHOLD)
+    match_iou_threshold = locked_eval_cfg.get("match_iou_threshold", 0.5)
+    min_score = locked_eval_cfg.get("eval_min_score", 0.01)
+    image_size = locked_eval_cfg.get("image_size", image_size)
+    max_det = locked_eval_cfg.get("max_det", MAX_DET)
+    print(f"[evaluate] Enforcing locked evaluation config tu {lock_path}:")
+    print(f"  conf_threshold={conf_threshold}, nms_iou={nms_iou_threshold}, min_score={min_score}, max_det={max_det}")
 
     # Load checkpoint
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+
+    # 3. Semantic Model/Seed Provenance Binding
+    ckpt_model = ckpt.get("model_name")
+    if ckpt_model and ckpt_model != model_name:
+        raise RuntimeError(
+            f"Model mismatch trong checkpoint provenance: file ghi model='{ckpt_model}', nhung evaluate voi model='{model_name}'"
+        )
+    ckpt_seed = ckpt.get("seed")
+    if ckpt_seed is not None and ckpt_seed != entry_info["seed"]:
+        raise RuntimeError(
+            f"Seed mismatch trong checkpoint provenance: file ghi seed={ckpt_seed}, nhung lock yeu cau seed={entry_info['seed']}"
+        )
+    ckpt_stem = Path(checkpoint_path).stem
+    if model_name not in ckpt_stem or str(entry_info["seed"]) not in ckpt_stem:
+        raise RuntimeError(
+            f"Checkpoint filename mismatch: '{checkpoint_path}' khong chua ca model '{model_name}' va seed '{entry_info['seed']}'"
+        )
+    if "provenance" in ckpt:
+        prov = ckpt["provenance"]
+        if prov.get("dataset_fingerprint") and prov["dataset_fingerprint"] != lock_data.get("dataset_fingerprint"):
+            raise RuntimeError("Dataset fingerprint trong checkpoint provenance khong khop voi protocol_lock.json!")
+        if lock_data.get("data_mode") == "real":
+            if prov.get("git_commit") and prov["git_commit"] != "git_commit_unknown" and prov["git_commit"] != lock_data.get("git_commit"):
+                raise RuntimeError(
+                    f"Git commit trong checkpoint ({prov['git_commit'][:8]}) khong khop voi protocol lock ({lock_data['git_commit'][:8]})!"
+                )
     image_size = ckpt.get("image_size", image_size)
     grid_size = ckpt.get("grid_size", get_grid_size(image_size=image_size, stride=STRIDE))
 
@@ -288,6 +332,7 @@ if __name__ == "__main__":
     p.add_argument("--lock_token", type=str, default=None, help="Token tu global_preflight_check()")
     p.add_argument("--lock_path", type=str, default="outputs/protocol_lock.json")
     p.add_argument("--output_dir", default="outputs")
+    p.add_argument("--data_mode", default="real", choices=["real", "demo"], help="Che do data: real hoac demo")
     a = p.parse_args()
 
     evaluate_model(
@@ -304,4 +349,5 @@ if __name__ == "__main__":
         lock_token=a.lock_token,
         lock_path=a.lock_path,
         output_dir=a.output_dir,
+        data_mode=a.data_mode,
     )

@@ -26,3 +26,12 @@ outputs/*.pth
 wandb/
 lightning_logs/
 runs/
+
+# --- Outputs & Runtime Protocol Artifacts ---
+outputs/protocol_lock*
+outputs/canonical_multi_seed*
+outputs/develop/
+outputs/history_*
+outputs/eval_*
+outputs/*.sha256
+outputs/*.tmp

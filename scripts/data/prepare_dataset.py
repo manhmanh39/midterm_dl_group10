@@ -13,7 +13,7 @@ import pydicom
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 
-from scripts.config import CLASS_NAMES, DataConfig
+from scripts.config import CLASS_NAMES, DataConfig, get_processed_data_root
 from scripts.data.utils import (
     _apply_voi_lut_and_invert, _normalize_to_8bit, load_annotations,
     build_yolo_dataset, write_yolo_yaml,
@@ -111,7 +111,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--zip_path", type=str, default="data/vinbigdata-chest-xray-abnormalities-detection(2).zip")
     parser.add_argument("--data_root", type=str, default="data/raw", help="Thu muc chua train.csv")
-    parser.add_argument("--output_root", type=str, default="data/processed/dataset_202601")
+    parser.add_argument("--output_root", type=str, default=get_processed_data_root(), help="Thu muc dataset dau ra")
     parser.add_argument("--image_size", type=int, default=512)
     parser.add_argument("--val_split", type=float, default=0.1)
     parser.add_argument("--test_split", type=float, default=0.1)

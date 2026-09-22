@@ -52,8 +52,11 @@ def get_git_commit() -> str:
         return "git_commit_unknown"
 
 
-def is_git_clean() -> bool:
-    """Kiem tra git working tree co hoan toan sach khong (khong co staged/unstaged changes)."""
+def is_git_clean(ignore_runtime_outputs: bool = True) -> bool:
+    """
+    Kiem tra git working tree co hoan toan sach khong (khong co staged/unstaged changes).
+    Mac dinh bo qua runtime artifacts sinh ra trong qua trinh train/lock/eval o thu muc outputs/.
+    """
     try:
         res = subprocess.run(
             ["git", "status", "--porcelain"],
@@ -62,9 +65,34 @@ def is_git_clean() -> bool:
             check=True,
             timeout=5,
         )
-        return len(res.stdout.strip()) == 0
+        lines = [line.strip() for line in res.stdout.splitlines() if line.strip()]
+        if not ignore_runtime_outputs:
+            return len(lines) == 0
+
+        unclean = []
+        for line in lines:
+            path_part = line[3:].strip().replace("\\", "/")
+            if path_part.startswith("outputs/"):
+                if any(path_part.startswith(f"outputs/{prefix}") for prefix in [
+                    "protocol_lock", "canonical_multi_seed", "develop", "history", "eval",
+                ]) or path_part.endswith((".sha256", ".png", ".log", ".tmp")):
+                    continue
+            unclean.append(line)
+        return len(unclean) == 0
     except Exception:
         return False
+
+
+def write_protocol_lock_sha256(lock_path: str | Path) -> str:
+    """
+    Tinh SHA-256 cua file protocol_lock.json va ghi ra sidecar {lock_path}.sha256.
+    Khoa tinh bat bien tuyet doi (Full-Lock Immutability).
+    """
+    p = Path(lock_path)
+    sha = compute_file_sha256(p)
+    sidecar_p = p.parent / f"{p.name}.sha256"
+    sidecar_p.write_text(f"{sha}  {p.name}\n", encoding="utf-8")
+    return sha
 
 
 def compute_file_sha256(path: str | Path) -> str:
@@ -164,6 +192,7 @@ class PreflightPermit:
     """
     token: str
     lock_path: str
+    lock_sha256: str
     dataset_root: str
     dataset_fingerprint: str
     issued_at_utc: str
@@ -173,6 +202,12 @@ class PreflightPermit:
     def verify(self, recheck_dataset: bool = True) -> bool:
         """Kiem tra permit hop le va tuy chon tai kiem tra fingerprint dataset tren dia."""
         if not verify_protocol_lock_token(self.token, lock_path=self.lock_path):
+            return False
+        # Full-Lock Immutability verification
+        if not Path(self.lock_path).is_file():
+            return False
+        current_lock_sha = compute_file_sha256(self.lock_path)
+        if current_lock_sha != self.lock_sha256:
             return False
         if recheck_dataset:
             cur_fp = compute_dataset_fingerprint(self.dataset_root)
@@ -206,13 +241,23 @@ def generate_protocol_lock(
     lock_path = Path(lock_path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # 0. Deduplication check cho ca real va demo
+    if len(models) != len(set(models)):
+        raise ValueError(f"Protocol Lock error: Duplicate model found in models list: {models}")
+    if len(seeds) != len(set(seeds)):
+        raise ValueError(f"Protocol Lock error: Duplicate seed found in seeds list: {seeds}")
+
     # 1. Enforce Exact Canonical 3x3 o che do real
     if data_mode == "real":
-        if set(models) != set(CANONICAL_MODELS) or set(seeds) != set(CANONICAL_SEEDS):
+        if sorted(list(models)) != sorted(CANONICAL_MODELS):
             raise ValueError(
                 f"Protocol Lock error (Real mode): Bat buoc dung chinh xac 3 canonical models "
-                f"{CANONICAL_MODELS} va 3 canonical seeds {CANONICAL_SEEDS} (tong cong 9 cap duy nhat).\n"
-                f"Received models: {models}, seeds: {seeds}"
+                f"{CANONICAL_MODELS} khong trung lap.\nReceived models: {models}"
+            )
+        if sorted(list(seeds)) != sorted(CANONICAL_SEEDS):
+            raise ValueError(
+                f"Protocol Lock error (Real mode): Bat buoc dung chinh xac 3 canonical seeds "
+                f"{CANONICAL_SEEDS} khong trung lap.\nReceived seeds: {seeds}"
             )
 
         # 2. Check Git HEAD & Working tree clean
@@ -283,7 +328,8 @@ def generate_protocol_lock(
     }
 
     lock_path.write_text(json.dumps(lock_data, indent=2), encoding="utf-8")
-    print(f"[protocol_lock] Da tao va khoa protocol thanh cong tai: {lock_path}")
+    lock_sha = write_protocol_lock_sha256(lock_path)
+    print(f"[protocol_lock] Da tao va khoa protocol thanh cong tai: {lock_path} (SHA: {lock_sha[:16]}...)")
     return lock_data
 
 
@@ -304,9 +350,32 @@ def global_preflight_check(
             f"Giai doan final-test yeu cau file lock da duoc sinh truoc tu phase=lock."
         )
 
+    # 0. Kiem tra Full-Lock Immutability qua Sidecar SHA256
+    sidecar_p = lock_file.parent / f"{lock_file.name}.sha256"
+    if not sidecar_p.is_file():
+        raise RuntimeError(
+            f"SECURITY ALERT (P1 Blocker): Thieu sidecar SHA256 cho file lock tai: {sidecar_p}!\n"
+            f"Moi protocol_lock.json bat buoc phai co file sidecar SHA256 song hanh de dam bao tinh bat bien."
+        )
+    sidecar_sha = sidecar_p.read_text(encoding="utf-8").strip().split()[0]
+    disk_lock_sha = compute_file_sha256(lock_file)
+    if sidecar_sha != disk_lock_sha:
+        raise RuntimeError(
+            f"SECURITY ALERT (P1 Blocker): Protocol lock immutability violated! File {lock_file} da bi sua doi!\n"
+            f"Sidecar SHA: {sidecar_sha}\n"
+            f"Disk SHA:    {disk_lock_sha}"
+        )
+
     lock_data = json.loads(lock_file.read_text(encoding="utf-8"))
     ds_root = Path(data_root or lock_data["dataset_root"])
-    mode = data_mode or lock_data.get("data_mode", "real")
+
+    # Anti-bypass: Neu lock la real thi khong cho phep dung data_mode=demo de bypass
+    if lock_data.get("data_mode") == "real" and data_mode == "demo":
+        raise ValueError(
+            "SECURITY ALERT: Khong the su dung data_mode='demo' voi protocol_lock duoc khoa o che do 'real'! "
+            "Day la vi pham quy tac bao mat giao thuc (Anti-Bypass Guard)."
+        )
+    mode = lock_data.get("data_mode", "real") if lock_data.get("data_mode") == "real" else (data_mode or "real")
 
     # 1. Kiem tra Git HEAD va Clean neu la real mode
     if mode == "real":
@@ -359,12 +428,13 @@ def global_preflight_check(
                 f"Disk SHA:    {disk_sha}"
             )
 
-    token_payload = f"{lock_data['dataset_fingerprint']}:{len(lock_data['checkpoints'])}:{lock_data['git_commit']}"
+    token_payload = f"{disk_lock_sha}:{lock_data['dataset_fingerprint']}:{lock_data['git_commit']}"
     token = _make_lock_token(token_payload)
 
     permit = PreflightPermit(
         token=token,
         lock_path=str(lock_file.as_posix()),
+        lock_sha256=disk_lock_sha,
         dataset_root=str(ds_root.as_posix()),
         dataset_fingerprint=lock_data["dataset_fingerprint"],
         issued_at_utc=datetime.now(timezone.utc).isoformat(),
@@ -389,9 +459,15 @@ def verify_protocol_lock_token(
         return False
     try:
         lock_data = json.loads(lock_file.read_text(encoding="utf-8"))
-        token_payload = f"{lock_data['dataset_fingerprint']}:{len(lock_data['checkpoints'])}:{lock_data['git_commit']}"
+        disk_lock_sha = compute_file_sha256(lock_file)
+        token_payload = f"{disk_lock_sha}:{lock_data['dataset_fingerprint']}:{lock_data['git_commit']}"
         expected_token = _make_lock_token(token_payload)
-        return hmac.compare_digest(token_str, expected_token)
+        if not hmac.compare_digest(token_str, expected_token):
+            return False
+        if isinstance(token_or_permit, PreflightPermit):
+            if token_or_permit.lock_sha256 != disk_lock_sha:
+                return False
+        return True
     except Exception:
         return False
 
@@ -405,6 +481,17 @@ def assert_test_access_allowed(
     Split Semantics Guard:
     Cam tuyet doi truy cap TestLoader neu khong co permit/token hop le hoac du lieu bi thay doi.
     """
+    lock_file = Path(lock_path)
+    if not lock_file.is_file():
+        raise RuntimeError("TEST SET ACCESS DENIED! Protocol lock khong ton tai.")
+
+    # Kiem tra sidecar immutability
+    sidecar_p = lock_file.parent / f"{lock_file.name}.sha256"
+    if not sidecar_p.is_file():
+        raise RuntimeError("TEST SET ACCESS DENIED! Protocol lock sidecar .sha256 bi thieu.")
+    if sidecar_p.read_text(encoding="utf-8").strip().split()[0] != compute_file_sha256(lock_file):
+        raise RuntimeError("TEST SET ACCESS DENIED! Protocol lock da bi thay doi (sidecar mismatch).")
+
     if not verify_protocol_lock_token(token_or_permit, lock_path=lock_path):
         raise RuntimeError(
             "TEST SET ACCESS DENIED! (Split Semantics Guard Fail-Closed)\n"
@@ -412,10 +499,16 @@ def assert_test_access_allowed(
             "global_preflight_check() voi PreflightPermit hop le."
         )
 
+    if isinstance(token_or_permit, PreflightPermit):
+        if not token_or_permit.verify(recheck_dataset=False):
+            raise RuntimeError(
+                "TEST SET ACCESS DENIED! PreflightPermit da bi vo hieu hoa (lock file thay doi sau khi cap)."
+            )
+
     # Dynamic re-check dataset fingerprint neu co dataset_root hoac permit
     root_to_check = dataset_root or (token_or_permit.dataset_root if isinstance(token_or_permit, PreflightPermit) else None)
     if root_to_check and Path(root_to_check).is_dir():
-        lock_data = json.loads(Path(lock_path).read_text(encoding="utf-8"))
+        lock_data = json.loads(lock_file.read_text(encoding="utf-8"))
         cur_fp = compute_dataset_fingerprint(root_to_check)
         if cur_fp != lock_data["dataset_fingerprint"]:
             raise RuntimeError(

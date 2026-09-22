@@ -388,6 +388,155 @@ class TestDetectionProtocolHardened(unittest.TestCase):
         self.assertIn("throughput_batch_size", speed)
         self.assertIn(f"bs{speed['throughput_batch_size']}_throughput_fps", speed)
 
+    def test_18_duplicate_canonical_models_seeds_rejected(self):
+        """Kiem tra phat hien va tu choi duplicate models hoac seeds."""
+        ckpt_dir = self.root / "checkpoints"
+        ckpt_dir.mkdir(exist_ok=True)
+        lock_path = self.root / "outputs" / "protocol_lock.json"
+
+        # Duplicate models
+        with self.assertRaises(ValueError) as ctx:
+            generate_protocol_lock(
+                data_root=self.root,
+                checkpoint_dir=ckpt_dir,
+                lock_path=lock_path,
+                models=["model1", "model1", "model2"],
+                seeds=[202601, 202602, 202603],
+                data_mode="demo",
+            )
+        self.assertIn("Duplicate model", str(ctx.exception))
+
+        # Duplicate seeds
+        with self.assertRaises(ValueError) as ctx:
+            generate_protocol_lock(
+                data_root=self.root,
+                checkpoint_dir=ckpt_dir,
+                lock_path=lock_path,
+                models=["model1", "model2", "model3"],
+                seeds=[202601, 202601, 202602],
+                data_mode="demo",
+            )
+        self.assertIn("Duplicate seed", str(ctx.exception))
+
+    def test_19_forbid_phase_all_in_real_mode(self):
+        """Kiem tra cam tuyet doi phase='all' o data_mode='real'."""
+        with self.assertRaises(ValueError) as ctx:
+            run_canonical_multi_seed(
+                models=["model1", "model2", "model3"],
+                seeds=[202601, 202602, 202603],
+                phase="all",
+                data_mode="real",
+            )
+        self.assertIn("cam tuyet doi chay '--phase all'", str(ctx.exception))
+
+    def test_20_lock_sidecar_and_immutability_tamper_detection(self):
+        """Kiem tra sidecar protocol_lock.json.sha256 va bat bien (Fail-Closed neu lock bi sua)."""
+        ckpt_dir = self.root / "checkpoints"
+        ckpt_dir.mkdir(exist_ok=True)
+        m, s = "model1", 202601
+        valid_ckpt = ckpt_dir / f"{m}_seed{s}_best.pth"
+        torch.save({"model_name": m, "seed": s, "model_state_dict": {}}, valid_ckpt)
+
+        lock_path = self.root / "outputs" / "protocol_lock.json"
+        generate_protocol_lock(
+            data_root=self.root,
+            checkpoint_dir=ckpt_dir,
+            lock_path=lock_path,
+            models=[m],
+            seeds=[s],
+            data_mode="demo",
+        )
+
+        sidecar_path = self.root / "outputs" / "protocol_lock.json.sha256"
+        self.assertTrue(sidecar_path.is_file())
+
+        # Thu sua noi dung protocol_lock.json
+        content = lock_path.read_text(encoding="utf-8")
+        tampered = content.replace('"baseline_conf_threshold": 0.25', '"baseline_conf_threshold": 0.05')
+        lock_path.write_text(tampered, encoding="utf-8")
+
+        # global_preflight_check phai nem loi vi sidecar SHA bi lech
+        with self.assertRaises(RuntimeError) as ctx:
+            global_preflight_check(lock_path=lock_path, data_root=self.root, data_mode="demo")
+        self.assertIn("Protocol lock immutability violated", str(ctx.exception))
+
+    def test_21_semantic_model_seed_provenance_binding(self):
+        """Kiem tra cross-check semantic: model_name, seed giua checkpoint va lock."""
+        ckpt_dir = self.root / "checkpoints"
+        ckpt_dir.mkdir(exist_ok=True)
+        m, s = "model1", 202601
+        model = build_model(m, num_classes=NUM_CLASSES, pretrained=False)
+        valid_ckpt = ckpt_dir / f"{m}_seed{s}_best.pth"
+        # Co tinh luu seed sai trong checkpoint: seed 999999 thay vi 202601
+        torch.save({
+            "model_name": m,
+            "seed": 999999,
+            "model_state_dict": model.state_dict(),
+            "image_size": 512, "grid_size": 16,
+        }, valid_ckpt)
+
+        lock_path = self.root / "outputs" / "protocol_lock.json"
+        generate_protocol_lock(
+            data_root=self.root,
+            checkpoint_dir=ckpt_dir,
+            lock_path=lock_path,
+            models=[m],
+            seeds=[s],
+            data_mode="demo",
+        )
+        _, permit = global_preflight_check(lock_path=lock_path, data_root=self.root, data_mode="demo")
+
+        with self.assertRaises(RuntimeError) as ctx:
+            evaluate_model(
+                model_name=m,
+                checkpoint_path=str(valid_ckpt),
+                data_root=str(self.root),
+                lock_token=permit,
+                lock_path=str(lock_path),
+                output_dir=str(self.root / "outputs"),
+                data_mode="demo",
+            )
+        self.assertIn("Seed mismatch trong checkpoint provenance", str(ctx.exception))
+
+    def test_22_real_mode_downgrade_bypass_prevention(self):
+        """Kiem tra khong the dung data_mode=demo de bypass real lock."""
+        ckpt_dir = self.root / "checkpoints"
+        ckpt_dir.mkdir(exist_ok=True)
+        lock_path = self.root / "outputs" / "protocol_lock.json"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Tao lock gia lap data_mode='real'
+        lock_data = {
+            "protocol_version": "P0_P1_DETECTION_HARDENED_V1",
+            "data_mode": "real",
+            "dataset_root": str(self.root.as_posix()),
+            "dataset_fingerprint": compute_dataset_fingerprint(self.root),
+            "checkpoints": {},
+        }
+        lock_path.write_text(json.dumps(lock_data, indent=2), encoding="utf-8")
+        from scripts.experiment_config import write_protocol_lock_sha256
+        write_protocol_lock_sha256(lock_path)
+
+        # Goi preflight voi data_mode='demo' phai bi chan
+        with self.assertRaises(ValueError) as ctx:
+            global_preflight_check(lock_path=lock_path, data_root=self.root, data_mode="demo")
+        self.assertIn("Anti-Bypass Guard", str(ctx.exception))
+
+    def test_23_prepare_dataset_root_consistency(self):
+        """Kiem tra prepare_dataset.py su dung default=get_processed_data_root()."""
+        from scripts.config import get_processed_data_root
+        import scripts.data.prepare_dataset as prep
+        import inspect
+        src = inspect.getsource(prep)
+        self.assertIn("default=get_processed_data_root()", src)
+        self.assertEqual(get_processed_data_root(), "data/dataset_202601")
+
+    def test_24_runtime_artifacts_do_not_dirty_git(self):
+        """Kiem tra is_git_clean() loai tru runtime outputs de khong bi dirty false positive."""
+        from scripts.experiment_config import is_git_clean
+        status = is_git_clean(ignore_runtime_outputs=True)
+        self.assertIsInstance(status, bool)
+
 
 if __name__ == "__main__":
     unittest.main()

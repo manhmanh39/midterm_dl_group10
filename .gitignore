@@ -20,6 +20,7 @@ checkpoints/
 *.pt
 outputs/develop/
 outputs/final_test/
+outputs/smoke/
 outputs/benchmarks/
 outputs/*.json
 outputs/*.csv

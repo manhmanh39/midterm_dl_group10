@@ -22,6 +22,7 @@ from benchmark_utils import benchmark_model_forward, save_benchmark
 from metrics_utils import collect_predictions, calibrate_thresholds_from_pr_curve
 from experiment_config import (
     DEVELOP_DIR,
+    get_develop_dir,
     compute_dataset_fingerprint,
     git_worktree_is_dirty,
     resolve_experiment_config,
@@ -137,7 +138,8 @@ def run_multi_seed_develop(
     print("\n" + "=" * 80)
     print("🔒 TIẾN HÀNH ĐÓNG BĂNG TOÀN BỘ CÁC THÍ NGHIỆM VÀ TẠO protocol_lock.json...")
     print("=" * 80)
-    lock_file = generate_protocol_lock(model_names=models, seeds=seeds, data_dir=data_dir, data_mode=mode)
+    develop_dir = get_develop_dir(data_mode=mode)
+    lock_file = generate_protocol_lock(model_names=models, seeds=seeds, data_dir=data_dir, data_mode=mode, develop_dir=develop_dir)
     print(f"✅ ĐÃ KHÓA THÀNH CÔNG: {lock_file}")
     return lock_file
 
@@ -157,14 +159,17 @@ def run_multi_seed_final_test(
     4. Sinh bảng so sánh tổng hợp với mean ± std (ddof=1).
     """
     mode = data_mode if data_mode is not None else config.DEFAULT_DATA_MODE
+    develop_dir = get_develop_dir(data_mode=mode)
     print("\n" + "=" * 80)
     print(f"      PHASE 2: GLOBAL PREFLIGHT & FINAL TEST EVALUATION (mode={mode})      ")
     print("=" * 80)
 
     # 1. BẮT BUỘC: GLOBAL PREFLIGHT CHECK TRÊN TOÀN BỘ 9 THÍ NGHIỆM
     print(">>> [FINAL-TEST] Kiểm tra Preflight toàn bộ artifacts trước khi tạo DataLoader...")
-    lock_file = DEVELOP_DIR / "protocol_lock.json"
-    global_preflight_check(data_dir=data_dir, lock_file=lock_file, data_mode=mode, enforce_clean_git=(mode == "real"))
+    lock_file = develop_dir / "protocol_lock.json"
+    if not lock_file.exists() and (DEVELOP_DIR / "protocol_lock.json").exists():
+        lock_file = DEVELOP_DIR / "protocol_lock.json"
+    global_preflight_check(data_dir=data_dir, lock_file=lock_file, data_mode=mode, enforce_clean_git=(mode == "real"), develop_dir=develop_dir)
 
     # 2. CHỈ TẠO TEST DATALOADER SAU KHI PREFLIGHT ĐÃ PASS
     print("\n>>> [FINAL-TEST] Toàn bộ 9 thí nghiệm đã hợp lệ. Khởi tạo Test DataLoader...")
@@ -179,8 +184,11 @@ def run_multi_seed_final_test(
             print(f"Đánh giá Test: {model_name.upper()} (Seed = {seed})")
             print("-" * 70)
 
-            ckpt_path = DEVELOP_DIR / model_name / f"seed{seed}" / "best.pth"
-            th_path = DEVELOP_DIR / model_name / f"seed{seed}" / "calibrated_thresholds.json"
+            ckpt_path = develop_dir / model_name / f"seed{seed}" / "best.pth"
+            th_path = develop_dir / model_name / f"seed{seed}" / "calibrated_thresholds.json"
+            if not ckpt_path.exists() and (DEVELOP_DIR / model_name / f"seed{seed}" / "best.pth").exists():
+                ckpt_path = DEVELOP_DIR / model_name / f"seed{seed}" / "best.pth"
+                th_path = DEVELOP_DIR / model_name / f"seed{seed}" / "calibrated_thresholds.json"
 
             evaluate_frozen_model(
                 model_name=model_name,

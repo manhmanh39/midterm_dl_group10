@@ -22,6 +22,7 @@ from benchmark_utils import benchmark_model_forward, save_benchmark
 from metrics_utils import collect_predictions, calibrate_thresholds_from_pr_curve
 from experiment_config import (
     DEVELOP_DIR,
+    get_develop_dir,
     compute_dataset_fingerprint,
     git_worktree_is_dirty,
     resolve_experiment_config,
@@ -86,6 +87,7 @@ def run_develop_phase(
             use_tuned=cli_args.use_tuned,
             parameter_sources=resolved.get("source"),
             data_mode=mode,
+            is_smoke=getattr(cli_args, "smoke", False),
         )
 
         # 3. Nạp lại Checkpoint tốt nhất để Calibrate trên tập Validation
@@ -151,7 +153,11 @@ def run_final_test_phase(
     dataset_meta = compute_dataset_fingerprint(data_dir=data_dir, data_mode=mode)
     is_demo = dataset_meta.get("is_demo_data", True)
 
-    lock_file = DEVELOP_DIR / "protocol_lock.json"
+    dev_dir = get_develop_dir(data_mode=mode)
+    lock_file = dev_dir / "protocol_lock.json"
+    if not lock_file.exists() and (DEVELOP_DIR / "protocol_lock.json").exists():
+        lock_file = DEVELOP_DIR / "protocol_lock.json"
+
     if not is_demo:
         if not lock_file.exists():
             raise FileNotFoundError(
@@ -174,8 +180,11 @@ def run_final_test_phase(
     device = config.DEVICE
 
     for model_name in model_names:
-        ckpt_path = DEVELOP_DIR / model_name / f"seed{seed}" / "best.pth"
-        th_path = DEVELOP_DIR / model_name / f"seed{seed}" / "calibrated_thresholds.json"
+        ckpt_path = dev_dir / model_name / f"seed{seed}" / "best.pth"
+        th_path = dev_dir / model_name / f"seed{seed}" / "calibrated_thresholds.json"
+        if not ckpt_path.exists() and (DEVELOP_DIR / model_name / f"seed{seed}" / "best.pth").exists():
+            ckpt_path = DEVELOP_DIR / model_name / f"seed{seed}" / "best.pth"
+            th_path = DEVELOP_DIR / model_name / f"seed{seed}" / "calibrated_thresholds.json"
 
         if not ckpt_path.exists() or not th_path.exists():
             raise FileNotFoundError(
@@ -231,6 +240,8 @@ if __name__ == "__main__":
     parser.add_argument("--data_dir", type=str, default=None)
     parser.add_argument("--data_mode", type=str, default=config.DEFAULT_DATA_MODE, choices=["real", "demo"])
     parser.add_argument("--seed", type=int, default=config.SEED)
+    parser.add_argument("--smoke", action="store_true", default=False,
+                        help="Lưu artifacts vào outputs/smoke/{data_mode}/ để kiểm thử độc lập mà không đụng đến develop")
 
     args = parser.parse_args()
     selected_models = ["simple", "complex", "transfer"] if args.model == "all" else [args.model]

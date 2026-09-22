@@ -29,6 +29,7 @@ from models import get_model
 from metrics_utils import compute_safe_macro_auc
 from experiment_config import (
     DEVELOP_DIR,
+    get_develop_dir,
     get_git_commit,
     git_worktree_is_dirty,
     compute_dataset_fingerprint,
@@ -182,6 +183,7 @@ def train(
     Huấn luyện mô hình thuần túy, lưu Checkpoint tốt nhất và Lưu Toàn Bộ History.
     """
     mode = data_mode if data_mode is not None else config.DEFAULT_DATA_MODE
+    is_smoke = kwargs.pop("is_smoke", False)
     if "optimizer_name" in kwargs:
         optimizer = kwargs["optimizer_name"]
     if "lr" in kwargs:
@@ -190,7 +192,8 @@ def train(
     set_seed(seed)
 
     if save_dir is None:
-        save_dir = DEVELOP_DIR / model_name / f"seed{seed}"
+        dev_dir = get_develop_dir(data_mode=mode, is_smoke=is_smoke)
+        save_dir = dev_dir / model_name / f"seed{seed}"
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
@@ -422,6 +425,8 @@ if __name__ == "__main__":
     parser.add_argument("--data_dir", type=str, default=None)
     parser.add_argument("--data_mode", type=str, default=config.DEFAULT_DATA_MODE, choices=["real", "demo"])
     parser.add_argument("--seed", type=int, default=config.SEED)
+    parser.add_argument("--smoke", action="store_true", default=False,
+                        help="Chạy smoke test lưu vào outputs/smoke/{data_mode}/ mà không đụng đến develop")
 
     args = parser.parse_args()
 
@@ -440,4 +445,5 @@ if __name__ == "__main__":
         seed=args.seed,
         use_tuned=args.use_tuned,
         data_mode=args.data_mode,
+        is_smoke=args.smoke,
     )

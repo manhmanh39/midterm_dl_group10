@@ -20,6 +20,7 @@ from data_loader import get_test_dataloader
 from models import get_model
 from experiment_config import (
     DEVELOP_DIR,
+    get_develop_dir,
     FINAL_TEST_DIR,
     compute_file_sha256,
     compute_dataset_fingerprint,
@@ -207,13 +208,19 @@ def evaluate_model(
     Hàm entry point kiểm tra tính toàn vẹn Fail-Closed trước khi tạo DataLoader.
     """
     mode = data_mode if data_mode is not None else config.DEFAULT_DATA_MODE
+    dev_dir = get_develop_dir(data_mode=mode)
+
     if checkpoint_path is None:
-        ckpt_file = DEVELOP_DIR / model_name / f"seed{seed}" / "best.pth"
+        ckpt_file = dev_dir / model_name / f"seed{seed}" / "best.pth"
+        if not ckpt_file.exists() and (DEVELOP_DIR / model_name / f"seed{seed}" / "best.pth").exists():
+            ckpt_file = DEVELOP_DIR / model_name / f"seed{seed}" / "best.pth"
     else:
         ckpt_file = Path(checkpoint_path)
 
     if threshold_path is None:
-        th_file = DEVELOP_DIR / model_name / f"seed{seed}" / "calibrated_thresholds.json"
+        th_file = dev_dir / model_name / f"seed{seed}" / "calibrated_thresholds.json"
+        if not th_file.exists() and (DEVELOP_DIR / model_name / f"seed{seed}" / "calibrated_thresholds.json").exists():
+            th_file = DEVELOP_DIR / model_name / f"seed{seed}" / "calibrated_thresholds.json"
     else:
         th_file = Path(threshold_path)
 
@@ -221,12 +228,15 @@ def evaluate_model(
     dataset_meta = compute_dataset_fingerprint(data_dir=data_dir, data_mode=mode)
     is_demo = dataset_meta.get("is_demo_data", True)
 
+    lock_file = dev_dir / "protocol_lock.json"
+    if not lock_file.exists() and (DEVELOP_DIR / "protocol_lock.json").exists():
+        lock_file = DEVELOP_DIR / "protocol_lock.json"
+
     if not is_demo:
         if not enforce_preflight:
             raise RuntimeError(
                 "[FAIL CLOSED] Giao thức cấm bỏ qua preflight (--skip_preflight) khi chạy Final-Test trên tập dữ liệu thật!"
             )
-        lock_file = DEVELOP_DIR / "protocol_lock.json"
         if not lock_file.exists():
             raise FileNotFoundError(
                 f"\n[FAIL CLOSED] Không tìm thấy file khóa giao thức bắt buộc: {lock_file}!\n"
@@ -237,7 +247,6 @@ def evaluate_model(
     else:
         # Trong môi trường demo/debug data
         if enforce_preflight:
-            lock_file = DEVELOP_DIR / "protocol_lock.json"
             if lock_file.exists():
                 global_preflight_check(data_dir=data_dir, lock_file=lock_file, enforce_clean_git=False, data_mode=mode)
             else:

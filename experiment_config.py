@@ -22,6 +22,29 @@ FINAL_TEST_DIR = config.OUTPUT_DIR / "final_test"
 BENCHMARK_DIR = config.OUTPUT_DIR / "benchmarks"
 
 
+def get_develop_dir(data_mode: Optional[str] = None, is_smoke: bool = False) -> Path:
+    """Trả về thư mục develop được phân tách theo namespace (demo / real / smoke)."""
+    if DEVELOP_DIR != config.OUTPUT_DIR / "develop":
+        return DEVELOP_DIR
+    mode = data_mode if data_mode is not None else config.DEFAULT_DATA_MODE
+    prefix = "smoke" if is_smoke else "develop"
+    mode_str = "demo" if mode == "demo" else "real"
+    target = config.OUTPUT_DIR / prefix / mode_str
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def get_final_test_dir(data_mode: Optional[str] = None) -> Path:
+    """Trả về thư mục final_test được phân tách theo namespace (demo / real)."""
+    if FINAL_TEST_DIR != config.OUTPUT_DIR / "final_test":
+        return FINAL_TEST_DIR
+    mode = data_mode if data_mode is not None else config.DEFAULT_DATA_MODE
+    mode_str = "demo" if mode == "demo" else "real"
+    target = config.OUTPUT_DIR / "final_test" / mode_str
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
 def get_git_commit(allow_fallback: bool = False) -> str:
     """Lấy mã băm Git commit hiện tại (HEAD) của repository. Fail-closed nếu thất bại."""
     try:
@@ -147,9 +170,10 @@ def generate_protocol_lock(
     seeds: Optional[List[int]] = None,
     data_dir: Optional[str] = None,
     data_mode: Optional[str] = None,
+    develop_dir: Optional[Path] = None,
 ) -> Path:
     """
-    Sinh file outputs/develop/protocol_lock.json khóa toàn bộ 9 bộ thí nghiệm
+    Sinh file protocol_lock.json khóa toàn bộ 9 bộ thí nghiệm
     sau khi phase develop hoàn tất và TRƯỚC KHI mở bất kỳ final-test nào.
     Kiểm tra set equality đúng 9 cặp canonical (3 models x 3 seeds).
     """
@@ -164,16 +188,17 @@ def generate_protocol_lock(
             "Giao thức P1 bắt buộc working tree phải sạch trước khi tạo protocol_lock.json."
         )
 
-    lock_file = DEVELOP_DIR / "protocol_lock.json"
-    DEVELOP_DIR.mkdir(parents=True, exist_ok=True)
+    dev_dir = Path(develop_dir) if develop_dir is not None else get_develop_dir(data_mode=mode)
+    dev_dir.mkdir(parents=True, exist_ok=True)
+    lock_file = dev_dir / "protocol_lock.json"
 
     experiments = []
     missing_items = []
 
     for model in model_names:
         for seed in seeds:
-            ckpt = DEVELOP_DIR / model / f"seed{seed}" / "best.pth"
-            thresh = DEVELOP_DIR / model / f"seed{seed}" / "calibrated_thresholds.json"
+            ckpt = dev_dir / model / f"seed{seed}" / "best.pth"
+            thresh = dev_dir / model / f"seed{seed}" / "calibrated_thresholds.json"
 
             if not ckpt.exists():
                 missing_items.append(f"Checkpoint thiếu: {ckpt}")
@@ -184,9 +209,9 @@ def generate_protocol_lock(
                 experiments.append({
                     "model": model,
                     "seed": seed,
-                    "checkpoint_rel_path": str(ckpt.relative_to(DEVELOP_DIR)),
+                    "checkpoint_rel_path": str(ckpt.relative_to(dev_dir)),
                     "checkpoint_sha256": compute_file_sha256(ckpt),
-                    "threshold_rel_path": str(thresh.relative_to(DEVELOP_DIR)),
+                    "threshold_rel_path": str(thresh.relative_to(dev_dir)),
                     "threshold_sha256": compute_file_sha256(thresh),
                 })
 
@@ -231,6 +256,7 @@ def global_preflight_check(
     lock_file: Optional[Path] = None,
     enforce_clean_git: bool = False,
     data_mode: Optional[str] = None,
+    develop_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """
     GLOBAL PREFLIGHT TRƯỚC KHI MỞ TEST SET:
@@ -239,8 +265,16 @@ def global_preflight_check(
     Enforce set equality đúng 9 cặp canonical trên real data.
     """
     mode = data_mode if data_mode is not None else config.DEFAULT_DATA_MODE
+    dev_dir = Path(develop_dir) if develop_dir is not None else get_develop_dir(data_mode=mode)
     if lock_file is None:
-        lock_file = DEVELOP_DIR / "protocol_lock.json"
+        candidate = dev_dir / "protocol_lock.json"
+        if candidate.exists():
+            lock_file = candidate
+        elif (DEVELOP_DIR / "protocol_lock.json").exists():
+            lock_file = DEVELOP_DIR / "protocol_lock.json"
+        else:
+            lock_file = candidate
+    lock_file = Path(lock_file)
 
     if not lock_file.exists():
         raise FileNotFoundError(
@@ -302,9 +336,10 @@ def global_preflight_check(
                 f"  Thừa/Lệch: {sorted(list(actual_pairs - expected_pairs))}"
             )
 
+    root_dev = lock_file.parent
     for exp in experiments:
-        ckpt_path = DEVELOP_DIR / exp["checkpoint_rel_path"]
-        thresh_path = DEVELOP_DIR / exp["threshold_rel_path"]
+        ckpt_path = root_dev / exp["checkpoint_rel_path"]
+        thresh_path = root_dev / exp["threshold_rel_path"]
 
         if not ckpt_path.exists():
             raise FileNotFoundError(f"[FAIL CLOSED] Thiếu checkpoint: {ckpt_path}")
@@ -485,9 +520,13 @@ def save_calibrated_thresholds(
     seed: int,
     checkpoint_path: Path,
     dataset_meta: Dict[str, Any],
+    save_dir: Optional[Path] = None,
 ) -> Path:
-    """Lưu thresholds calibrated vào outputs/develop/{model_name}/seed{seed}/calibrated_thresholds.json."""
-    save_dir = DEVELOP_DIR / model_name / f"seed{seed}"
+    """Lưu thresholds calibrated vào cùng thư mục với checkpoint."""
+    checkpoint_path = Path(checkpoint_path)
+    if save_dir is None:
+        save_dir = checkpoint_path.parent
+    save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
     if not dataset_meta.get("is_demo_data", True) and git_worktree_is_dirty():
@@ -537,13 +576,18 @@ def save_final_test_artifacts(
     model_name: str,
     seed: int,
     provenance: Dict[str, Any],
+    final_test_dir: Optional[Path] = None,
 ) -> Tuple[Path, Path]:
-    """Lưu kết quả final test vào outputs/final_test/{model_name}_seed{seed}_metrics.json & .csv."""
-    FINAL_TEST_DIR.mkdir(parents=True, exist_ok=True)
+    """Lưu kết quả final test vào outputs/final_test/{data_mode}/{model_name}_seed{seed}_metrics.json & .csv."""
+    if final_test_dir is None:
+        data_mode = provenance.get("data_mode")
+        final_test_dir = get_final_test_dir(data_mode=data_mode)
+    final_test_dir = Path(final_test_dir)
+    final_test_dir.mkdir(parents=True, exist_ok=True)
 
     base_name = f"{model_name}_seed{seed}"
-    json_path = FINAL_TEST_DIR / f"{base_name}_metrics.json"
-    csv_per_class = FINAL_TEST_DIR / f"{base_name}_per_class.csv"
+    json_path = final_test_dir / f"{base_name}_metrics.json"
+    csv_per_class = final_test_dir / f"{base_name}_per_class.csv"
 
     # 1. Lưu JSON
     full_data = {

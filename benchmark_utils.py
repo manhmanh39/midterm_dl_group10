@@ -60,6 +60,7 @@ def benchmark_model_forward(
     Sử dụng torch.inference_mode() và đồng bộ CUDA (nếu có).
     """
     model.eval()
+    device = torch.device(device)
     is_cuda = (device.type == "cuda" and torch.cuda.is_available())
 
     # --- 1. Latency Benchmark (Batch Size = 1) ---

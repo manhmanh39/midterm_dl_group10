@@ -1,6 +1,7 @@
 """
 evaluate.py - Danh gia detector tren TestLoader voi Single-Pass Traversal va Split Guard.
 Dung cho Final-Test sau khi da khoa protocol_lock.json va vuot qua global_preflight_check().
+(Hardened implementation theo 18 chi muc kiem toan).
 """
 from __future__ import annotations
 
@@ -8,7 +9,7 @@ import argparse
 import json
 import os
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Union
 
 import matplotlib
 matplotlib.use("Agg")
@@ -21,6 +22,7 @@ from scripts.config import (
     CONF_THRESHOLD,
     IMAGE_SIZE,
     LAMBDA_COORD,
+    MAX_DET,
     NMS_IOU_THRESHOLD,
     NUM_CLASSES,
     STRIDE,
@@ -28,6 +30,11 @@ from scripts.config import (
     get_processed_data_root,
 )
 from scripts.data.prepared_loader import get_test_dataloader
+from scripts.experiment_config import (
+    PreflightPermit,
+    compute_file_sha256,
+    verify_protocol_lock_token,
+)
 from scripts.models.factory import build_model
 from scripts.src.decode import decode_predictions
 from scripts.src.metrics import _iou_1_to_n, compute_voc_ap
@@ -37,24 +44,67 @@ from scripts.src.utils import CombinedLocalizationLoss, calculate_iou
 def evaluate_model(
     model_name: str,
     checkpoint_path: str,
-    data_root: str = "data/dataset_202601",
+    data_root: Optional[str] = None,
     image_size: int = IMAGE_SIZE,
     batch_size: int = 16,
     num_workers: int = 4,
-    conf_threshold: float = CONF_THRESHOLD,
-    nms_iou_threshold: float = NMS_IOU_THRESHOLD,
-    match_iou_threshold: float = 0.5,
-    min_score: float = 0.01,
-    lock_token: Optional[str] = None,
+    conf_threshold: Optional[float] = None,
+    nms_iou_threshold: Optional[float] = None,
+    match_iou_threshold: Optional[float] = None,
+    min_score: Optional[float] = None,
+    lock_token: Optional[Union[str, PreflightPermit]] = None,
+    lock_path: str = "outputs/protocol_lock.json",
     output_dir: str = "outputs",
 ) -> Dict:
     """
     Danh gia Test Set dung 1 pass duy nhat (1 traversal qua TestLoader).
-    Bat buoc phai co lock_token tu global_preflight_check() de mo TestLoader.
+    Bat buoc phai co lock_token/PreflightPermit tu global_preflight_check().
+    Enforce bat buoc checkpoint phai thuoc protocol_lock.json va tu dong nap
+    evaluation config duoc khoa tu lock_path (khong cho phep CLI ghi de tham so test).
     """
+    data_root = data_root or get_processed_data_root()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint khong ton tai: {checkpoint_path}")
+
+    # 1. Enforce Checkpoint thuoc Lock & tinh toan disk SHA
+    disk_sha = compute_file_sha256(checkpoint_path)
+    lock_file = Path(lock_path)
+    if lock_file.is_file():
+        lock_data = json.loads(lock_file.read_text(encoding="utf-8"))
+        registered_checkpoints = {
+            info["sha256"]: (k, info) for k, info in lock_data.get("checkpoints", {}).items()
+        }
+        if disk_sha not in registered_checkpoints:
+            raise RuntimeError(
+                f"SECURITY ALERT (P1 Blocker): Checkpoint '{checkpoint_path}' (SHA: {disk_sha[:16]}...) "
+                f"KHONG thuoc danh sach 9 checkpoints da khoa trong {lock_path}!\n"
+                f"Final-Test chi chap nhan checkpoint da qua preflight va duoc dang ky trong protocol_lock.json."
+            )
+        entry_key, entry_info = registered_checkpoints[disk_sha]
+        if entry_info["model"] != model_name:
+            raise RuntimeError(
+                f"Model mismatch trong lock: entry yeu cau model '{entry_info['model']}', nhung goi voi '{model_name}'"
+            )
+
+        # 2. Enforce Evaluation Config tu Lock (Overriding CLI flags)
+        locked_eval_cfg = lock_data.get("evaluation_config", {})
+        conf_threshold = locked_eval_cfg.get("baseline_conf_threshold", CONF_THRESHOLD)
+        nms_iou_threshold = locked_eval_cfg.get("baseline_nms_iou", NMS_IOU_THRESHOLD)
+        match_iou_threshold = locked_eval_cfg.get("match_iou_threshold", 0.5)
+        min_score = locked_eval_cfg.get("eval_min_score", 0.01)
+        image_size = locked_eval_cfg.get("image_size", image_size)
+        max_det = locked_eval_cfg.get("max_det", MAX_DET)
+        print(f"[evaluate] Enforcing locked evaluation config tu {lock_path}:")
+        print(f"  conf_threshold={conf_threshold}, nms_iou={nms_iou_threshold}, min_score={min_score}, max_det={max_det}")
+    else:
+        # Fallback cho standalone test khi khong co lock_file (se bi chan boi split guard neu khong co token)
+        conf_threshold = conf_threshold if conf_threshold is not None else CONF_THRESHOLD
+        nms_iou_threshold = nms_iou_threshold if nms_iou_threshold is not None else NMS_IOU_THRESHOLD
+        match_iou_threshold = match_iou_threshold if match_iou_threshold is not None else 0.5
+        min_score = min_score if min_score is not None else 0.01
+        max_det = MAX_DET
 
     # Load checkpoint
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
@@ -72,13 +122,14 @@ def evaluate_model(
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
 
-    # Split Semantics Guard: Bat buoc co lock_token hop le
+    # Split Semantics Guard: Bat buoc co lock_token/PreflightPermit hop le
     loader, ds = get_test_dataloader(
         data_root=data_root,
         batch_size=batch_size,
         image_size=image_size,
         num_workers=num_workers,
         lock_token=lock_token,
+        lock_path=lock_path,
     )
 
     criterion = CombinedLocalizationLoss(lambda_coord=ckpt.get("hparams", {}).get("lambda_coord", LAMBDA_COORD))
@@ -88,7 +139,6 @@ def evaluate_model(
     n_batches = 0
     preds_dict = {}
     gts_dict = {}
-    idx = 0
 
     print(f"[evaluate] Bat dau Single-Pass Traversal qua TestLoader ({len(ds)} anh)...")
     # Traversal DUY NHAT 1 lan qua TestLoader
@@ -96,28 +146,25 @@ def evaluate_model(
         for batch in loader:
             imgs = batch[0].to(device)
             targets = batch[1].to(device)
-            image_ids = batch[2] if len(batch) > 2 else None
+            if len(batch) < 3 or batch[2] is None:
+                raise RuntimeError("TestLoader batch missing image_ids! Exact alignment requires image_ids.")
+            image_ids = batch[2]
 
             preds = model(imgs)
             tot_loss += criterion(preds, targets).item()
             tot_iou += calculate_iou(preds, targets, grid_size)
             n_batches += 1
 
-            # Decode predictions de danh gia mAP
-            dec = decode_predictions(preds, min_score=min_score, nms_iou_threshold=nms_iou_threshold)
+            # Decode predictions voi min_score tu lock de tinh toan ven PR curve
+            dec = decode_predictions(preds, min_score=min_score, nms_iou_threshold=nms_iou_threshold, max_det=max_det)
             for i, d in enumerate(dec):
-                img_id = image_ids[i] if (image_ids is not None and i < len(image_ids)) else f"img_{idx}"
+                if i >= len(image_ids):
+                    raise IndexError(f"Prediction index {i} exceeds image_ids length {len(image_ids)}")
+                img_id = str(image_ids[i])
                 preds_dict[img_id] = {k: v.cpu().numpy() for k, v in d.items()}
 
-                if hasattr(ds, "get_raw_boxes_by_id"):
-                    try:
-                        raw = ds.get_raw_boxes_by_id(img_id)
-                    except Exception:
-                        raw = ds.get_raw_boxes(idx) if idx < len(ds) else []
-                elif hasattr(ds, "get_raw_boxes") and idx < len(ds):
-                    raw = ds.get_raw_boxes(idx)
-                else:
-                    raw = []
+                # Strict lookup qua image_id: khong co bat ky sequential fallback nao
+                raw = ds.get_raw_boxes_by_id(img_id)
 
                 if raw:
                     a = np.array(raw, dtype=np.float32)
@@ -128,7 +175,6 @@ def evaluate_model(
                     bx, lab = np.zeros((0, 4), np.float32), np.zeros((0,), np.int64)
 
                 gts_dict[img_id] = (bx, lab)
-                idx += 1
 
     # Tinh VOC continuous all-points mAP@0.5 va operating metrics (P/R/F1)
     ap = np.zeros(NUM_CLASSES)
@@ -216,7 +262,7 @@ def evaluate_model(
     print(f"  Loss: {det['loss']:.4f} | IoU: {det['iou']:.4f} | mAP@0.5: {det['map50']:.4f}")
     print(f"  Macro P/R/F1: {det['macro_precision']:.3f} / {det['macro_recall']:.3f} / {det['macro_f1']:.3f}")
     print(f"  Micro P/R/F1: {det['micro_precision']:.3f} / {det['micro_recall']:.3f} / {det['micro_f1']:.3f}")
-    print(f"  Preds/anh: {det['mean_preds_per_image']:.2f} (eval_min_score={min_score})")
+    print(f"  Operating Conf Threshold: {conf_threshold:.2f} | Eval Min Score: {min_score:.2f}")
 
     os.makedirs(output_dir, exist_ok=True)
     stem = Path(checkpoint_path).stem
@@ -228,18 +274,19 @@ def evaluate_model(
 
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(description="Evaluate detector on Test set with single-pass and protocol guard")
     p.add_argument("--model", default="model1", choices=["model1", "model2", "model3"])
     p.add_argument("--checkpoint", required=True)
-    p.add_argument("--data_root", default="data/dataset_202601")
+    p.add_argument("--data_root", default=None, help="Mac dinh lay tu get_processed_data_root()")
     p.add_argument("--image_size", type=int, default=IMAGE_SIZE)
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--num_workers", type=int, default=4)
-    p.add_argument("--conf_threshold", type=float, default=CONF_THRESHOLD)
-    p.add_argument("--nms_iou_threshold", type=float, default=NMS_IOU_THRESHOLD)
-    p.add_argument("--match_iou_threshold", type=float, default=0.5)
-    p.add_argument("--min_score", type=float, default=0.01)
+    p.add_argument("--conf_threshold", type=float, default=None)
+    p.add_argument("--nms_iou_threshold", type=float, default=None)
+    p.add_argument("--match_iou_threshold", type=float, default=None)
+    p.add_argument("--min_score", type=float, default=None)
     p.add_argument("--lock_token", type=str, default=None, help="Token tu global_preflight_check()")
+    p.add_argument("--lock_path", type=str, default="outputs/protocol_lock.json")
     p.add_argument("--output_dir", default="outputs")
     a = p.parse_args()
 
@@ -255,5 +302,6 @@ if __name__ == "__main__":
         match_iou_threshold=a.match_iou_threshold,
         min_score=a.min_score,
         lock_token=a.lock_token,
+        lock_path=a.lock_path,
         output_dir=a.output_dir,
     )

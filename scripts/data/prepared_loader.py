@@ -69,10 +69,16 @@ def describe_split(root: str | Path, split: str) -> Dict[str, float]:
     }
 
 
-def describe_dataset(root: str | Path) -> Dict[str, Dict[str, float]]:
-    """Mo ta ca 3 split (train/val/test) cua 1 dataset da prepared."""
+def describe_dataset(
+    root: str | Path,
+    splits: Tuple[str, ...] = ("train", "val", "test"),
+) -> Dict[str, Dict[str, float]]:
+    """
+    Mo ta cac split duoc yeu cau. Trong giai doan Develop, chi duoc phep
+    truyen splits=('train', 'val') de tranh leakage thong ke tap test truoc freeze.
+    """
     result = {}
-    for split in ("train", "val", "test"):
+    for split in splits:
         result[split] = describe_split(root, split)
     return result
 
@@ -164,14 +170,15 @@ def get_test_dataloader(
     batch_size: int = 16,
     image_size: int = IMAGE_SIZE,
     num_workers: int = 4,
-    lock_token: Optional[str] = None,
+    lock_token: Optional[Union[str, object]] = None,
     lock_path: str | Path = "outputs/protocol_lock.json",
 ) -> Tuple[DataLoader, VinBigDataDetectionDataset]:
     """
     Split Semantics Guard:
-    Chi mo TestLoader khi cung cap protocol_lock_token hop le tu global_preflight_check().
+    Chi mo TestLoader khi cung cap protocol_lock_token/PreflightPermit hop le tu global_preflight_check().
+    Dong thoi tai kiem tra dataset fingerprint tren dia de ngan ngua thay doi muon.
     """
-    assert_test_access_allowed(lock_token, lock_path=lock_path)
+    assert_test_access_allowed(lock_token, lock_path=lock_path, dataset_root=data_root)
 
     root = Path(data_root)
     test_dir = root / "test"

@@ -35,6 +35,7 @@ class VinBigDataDetectionDataset(Dataset):
         return len(self.image_files)
 
     def _read_raw_boxes(self, label_path: Path):
+        import math
         if not label_path.exists():
             raise FileNotFoundError(
                 f"Missing label file: {label_path}. Detection dataset requires a .txt label file "
@@ -43,23 +44,62 @@ class VinBigDataDetectionDataset(Dataset):
         text = label_path.read_text(encoding="utf-8").strip()
         boxes = []
         if text:
-            for line in text.splitlines():
+            for line_idx, raw_line in enumerate(text.splitlines(), start=1):
+                line = raw_line.strip()
+                if not line:
+                    continue
                 parts = line.split()
                 if len(parts) != 5:
-                    continue
-                cls_id = int(float(parts[0]))
-                cx, cy, w, h = (float(v) for v in parts[1:])
-                if 0 <= cls_id < NUM_CLASSES and w > 0 and h > 0:
-                    boxes.append((cls_id, cx, cy, w, h))
-        return boxes
+                    raise ValueError(
+                        f"Malformed annotation in {label_path} line {line_idx}: "
+                        f"expected exactly 5 fields, got {len(parts)} in '{raw_line}'"
+                    )
+                try:
+                    cls_f = float(parts[0])
+                    cls_id = int(cls_f)
+                    if cls_f != cls_id:
+                        raise ValueError(f"Class ID must be integer, got {parts[0]}")
+                except Exception as e:
+                    raise ValueError(f"Malformed class ID in {label_path} line {line_idx}: '{parts[0]}' - {e}")
 
-    def get_raw_boxes(self, idx: int):
-        """GT that tu file label theo index (khong mat box do va cham cell)."""
-        return self._read_raw_boxes(self.lbl_dir / f"{self.image_files[idx].stem}.txt")
+                if not (0 <= cls_id < NUM_CLASSES):
+                    raise ValueError(
+                        f"Class ID out of range [0, {NUM_CLASSES - 1}] in {label_path} line {line_idx}: {cls_id}"
+                    )
+
+                try:
+                    cx, cy, w, h = (float(v) for v in parts[1:])
+                except Exception as e:
+                    raise ValueError(f"Malformed coordinate in {label_path} line {line_idx}: '{raw_line}' - {e}")
+
+                if not (math.isfinite(cx) and math.isfinite(cy) and math.isfinite(w) and math.isfinite(h)):
+                    raise ValueError(f"Non-finite coordinate (NaN/Inf) in {label_path} line {line_idx}: '{raw_line}'")
+
+                if not (0.0 <= cx <= 1.0 and 0.0 <= cy <= 1.0):
+                    raise ValueError(
+                        f"Center coordinates out of range [0, 1] in {label_path} line {line_idx}: cx={cx}, cy={cy}"
+                    )
+
+                if not (0.0 < w <= 1.0 and 0.0 < h <= 1.0):
+                    raise ValueError(
+                        f"Box dimensions out of range (0, 1] in {label_path} line {line_idx}: w={w}, h={h}"
+                    )
+
+                boxes.append((cls_id, cx, cy, w, h))
+        return boxes
 
     def get_raw_boxes_by_id(self, image_id: str):
         """GT that tu file label theo image_id (khong mat box do va cham cell). Dung cho mAP."""
-        return self._read_raw_boxes(self.lbl_dir / f"{image_id}.txt")
+        lbl_p = self.lbl_dir / f"{image_id}.txt"
+        if not lbl_p.exists():
+            raise FileNotFoundError(f"Missing label file for image_id '{image_id}': {lbl_p}")
+        return self._read_raw_boxes(lbl_p)
+
+    def get_raw_boxes(self, idx: int):
+        """GT that tu file label theo index (khong mat box do va cham cell)."""
+        if not (0 <= idx < len(self.image_files)):
+            raise IndexError(f"Index {idx} out of range for dataset of size {len(self.image_files)}")
+        return self.get_raw_boxes_by_id(self.image_files[idx].stem)
 
     def _encode_grid_target(self, boxes):
         G = self.grid_size

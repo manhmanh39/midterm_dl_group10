@@ -41,8 +41,9 @@ def run_model_benchmarks(
         complexity = measure_model_complexity(model, img_size=image_size)
         speed = benchmark_detection_inference(model, device=device, img_size=image_size, num_warmup=5, num_runs=20)
         benchmarks[m] = {**complexity, **speed}
+        bs = speed.get("throughput_batch_size", 16)
         print(f"    Params: {complexity['total_params']:,} | RAM: {complexity['state_dict_size_mib']:.2f} MiB")
-        print(f"    BS=1 Latency: {speed['bs1_latency_median_ms']:.2f} ms | BS=16 FPS: {speed['bs16_throughput_fps']:.1f}")
+        print(f"    BS=1 Latency: {speed['bs1_latency_median_ms']:.2f} ms | BS={bs} FPS: {speed['throughput_fps']:.1f} ({speed.get('benchmark_device', 'unknown')})")
 
     return benchmarks
 
@@ -66,12 +67,13 @@ def build_comparison_table(
 
     table_rows = []
     for m in models:
+        bs = benchmarks[m].get("throughput_batch_size", 16)
         row = {
             "Model Architecture": m,
             "Total Params": f"{benchmarks[m]['total_params']:,}",
             "RAM (state_dict MiB)": f"{benchmarks[m]['state_dict_size_mib']:.2f}",
             "Latency BS=1 (ms)": f"{benchmarks[m]['bs1_latency_median_ms']:.2f}",
-            "Throughput BS=16 (FPS)": f"{benchmarks[m]['bs16_throughput_fps']:.1f}",
+            f"Throughput BS={bs} (FPS)": f"{benchmarks[m]['throughput_fps']:.1f}",
         }
 
         if m in test_data:

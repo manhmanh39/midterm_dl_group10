@@ -48,32 +48,30 @@ def evaluate_detections(model, dataset, loader, device, num_classes,
     model.eval()
     preds_dict = {}
     gts_dict = {}
-    idx = 0
 
     for bi, batch in enumerate(loader):
         if max_batches is not None and bi >= max_batches:
             break
         imgs = batch[0].to(device)
-        image_ids = batch[2] if len(batch) > 2 else None
+        if len(batch) < 3 or batch[2] is None:
+            raise RuntimeError(
+                "evaluate_detections requires DataLoader/collate_fn to provide image_ids "
+                "for exact GT-prediction alignment (no sequential index fallback allowed)."
+            )
+        image_ids = batch[2]
 
         dec = decode_predictions(model(imgs), min_score=min_score, nms_iou_threshold=nms_iou)
         for i, d in enumerate(dec):
-            if image_ids is not None and i < len(image_ids):
-                img_id = image_ids[i]
-            else:
-                img_id = f"img_{idx}"
+            if i >= len(image_ids):
+                raise IndexError(f"Prediction index {i} out of bounds for batch image_ids of size {len(image_ids)}")
+            img_id = str(image_ids[i])
 
             preds_dict[img_id] = {k: v.cpu().numpy() for k, v in d.items()}
 
             if hasattr(dataset, "get_raw_boxes_by_id"):
-                try:
-                    raw = dataset.get_raw_boxes_by_id(img_id)
-                except Exception:
-                    raw = dataset.get_raw_boxes(idx) if idx < len(dataset) else []
-            elif hasattr(dataset, "get_raw_boxes") and idx < len(dataset):
-                raw = dataset.get_raw_boxes(idx)
+                raw = dataset.get_raw_boxes_by_id(img_id)
             else:
-                raw = []
+                raise AttributeError("Dataset must implement get_raw_boxes_by_id(image_id) for exact sample alignment.")
 
             if raw:
                 a = np.array(raw, dtype=np.float32)
@@ -84,7 +82,6 @@ def evaluate_detections(model, dataset, loader, device, num_classes,
                 bx, lab = np.zeros((0, 4), np.float32), np.zeros((0,), np.int64)
 
             gts_dict[img_id] = (bx, lab)
-            idx += 1
 
     ap = np.zeros(num_classes)
     P = np.zeros(num_classes)

@@ -1,23 +1,31 @@
 """
 scripts/experiment_config.py - Quan ly cau hinh thuc nghiem, Provenance, Dataset Fingerprint,
 Protocol Lock, va Test Split Access Guard cho VinBigData Object Detection P0/P1.
+(Hardened implementation theo 18 chi muc kiem toan).
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
+from datetime import datetime, timezone
 import hashlib
 import hmac
 import json
 import os
-import subprocess
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+import subprocess
+from typing import Dict, List, Optional, Tuple, Union
 
 from scripts.config import (
+    BASELINE_CONF_THRESHOLD,
+    BASELINE_NMS_IOU,
     CLASS_NAMES,
-    CONF_THRESHOLD,
+    EVAL_MIN_SCORE,
     IMAGE_SIZE,
+    MATCH_IOU_THRESHOLD,
+    MAX_DET,
     NMS_IOU_THRESHOLD,
     NUM_CLASSES,
+    PREPROCESSING_IDENTITY,
     STRIDE,
     get_grid_size,
     get_processed_data_root,
@@ -26,17 +34,11 @@ from scripts.config import (
 CANONICAL_SEEDS: List[int] = [202601, 202602, 202603]
 CANONICAL_MODELS: List[str] = ["model1", "model2", "model3"]
 
-# Bi-phase threshold policy
-EVAL_MIN_SCORE: float = 0.01       # Dung cho PR curve va continuous VOC all-points mAP@0.5
-BASELINE_CONF_THRESHOLD: float = 0.25 # P1 baseline operating point
-BASELINE_NMS_IOU: float = 0.45        # P1 baseline NMS IoU
-MATCH_IOU_THRESHOLD: float = 0.5      # IoU threshold de coi la True Positive
-
-_PROTOCOL_SECRET: bytes = b"vinbigdata_detection_p0_p1_lock_salt_2026"
+_PROTOCOL_SECRET: bytes = b"vinbigdata_detection_p0_p1_hardened_salt_2026"
 
 
 def get_git_commit() -> str:
-    """Lay SHA commit git hien tai hoac fallback neu khong co git repo."""
+    """Lay SHA commit git HEAD hien tai hoac tra ve git_commit_unknown."""
     try:
         res = subprocess.run(
             ["git", "rev-parse", "HEAD"],
@@ -48,6 +50,21 @@ def get_git_commit() -> str:
         return res.stdout.strip()
     except Exception:
         return "git_commit_unknown"
+
+
+def is_git_clean() -> bool:
+    """Kiem tra git working tree co hoan toan sach khong (khong co staged/unstaged changes)."""
+    try:
+        res = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=5,
+        )
+        return len(res.stdout.strip()) == 0
+    except Exception:
+        return False
 
 
 def compute_file_sha256(path: str | Path) -> str:
@@ -77,7 +94,8 @@ def write_checkpoint_sha256(checkpoint_path: str | Path) -> str:
 def compute_split_fingerprint(split_dir: Path) -> str:
     """
     Tinh fingerprint cho 1 split (train/val/test) gom images/ va labels/.
-    Bao gom: danh sach sorted ten file, kich thuoc, va noi dung labels.
+    - Bắt buộc quan hệ song ánh tuyệt đối: set(image_stems) == set(label_stems).
+    - Băm đầy đủ từng byte dữ liệu của toàn bộ ảnh .png và nhãn .txt.
     """
     img_dir = split_dir / "images"
     lbl_dir = split_dir / "labels"
@@ -87,21 +105,36 @@ def compute_split_fingerprint(split_dir: Path) -> str:
     if not lbl_dir.is_dir():
         raise FileNotFoundError(f"Thieu thu muc nhan trong split: {lbl_dir}")
 
-    h = hashlib.sha256()
     image_files = sorted(img_dir.glob("*.png"))
-    for img_p in image_files:
-        h.update(img_p.name.encode("utf-8"))
-        h.update(str(img_p.stat().st_size).encode("utf-8"))
+    label_files = sorted(lbl_dir.glob("*.txt"))
 
+    img_stems = set(p.stem for p in image_files)
+    lbl_stems = set(p.stem for p in label_files)
+
+    # Enforce exact bijection
+    if img_stems != lbl_stems:
+        missing_lbl = img_stems - lbl_stems
+        orphan_lbl = lbl_stems - img_stems
+        raise RuntimeError(
+            f"Dataset integrity violation tai {split_dir}: Danh sach anh va nhan khong song anh!\n"
+            f"  - So anh thieu file nhan: {len(missing_lbl)} (vi du: {list(missing_lbl)[:3]})\n"
+            f"  - So file nhan mo coi: {len(orphan_lbl)} (vi du: {list(orphan_lbl)[:3]})"
+        )
+
+    h = hashlib.sha256()
+    for img_p in image_files:
+        # Băm relative path + kích thước + toàn bộ raw bytes của ảnh PNG
+        h.update(f"img:{img_p.name}:{img_p.stat().st_size}".encode("utf-8"))
+        with open(img_p, "rb") as f:
+            while chunk := f.read(65536):
+                h.update(chunk)
+
+        # Băm relative path + kích thước + toàn bộ raw bytes của nhãn TXT
         lbl_p = lbl_dir / f"{img_p.stem}.txt"
-        if not lbl_p.exists():
-            raise FileNotFoundError(
-                f"Missing label file: {lbl_p}. Empty vs missing label contract requires "
-                f"a label file for every image (0-byte file represents No-Finding)."
-            )
-        h.update(lbl_p.name.encode("utf-8"))
-        lbl_bytes = lbl_p.read_bytes()
-        h.update(hashlib.sha256(lbl_bytes).digest())
+        h.update(f"lbl:{lbl_p.name}:{lbl_p.stat().st_size}".encode("utf-8"))
+        with open(lbl_p, "rb") as f:
+            while chunk := f.read(65536):
+                h.update(chunk)
 
     return h.hexdigest()
 
@@ -109,7 +142,7 @@ def compute_split_fingerprint(split_dir: Path) -> str:
 def compute_dataset_fingerprint(data_root: str | Path) -> str:
     """
     Canonical Dataset Fingerprint:
-    Bao gom: SHA cua train, val, test splits, danh sach ten lop va so luong lop.
+    SHA256 băm toàn bộ bytes của train, val, test, cùng danh sách 14 tên lớp bệnh học.
     """
     root = Path(data_root)
     train_sha = compute_split_fingerprint(root / "train")
@@ -123,16 +156,48 @@ def compute_dataset_fingerprint(data_root: str | Path) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+@dataclass
+class PreflightPermit:
+    """
+    Giấy phép truy cập TestLoader cấp từ global_preflight_check().
+    Cung cấp cơ chế dynamic re-verification chống thay đổi artifact sau khi cấp.
+    """
+    token: str
+    lock_path: str
+    dataset_root: str
+    dataset_fingerprint: str
+    issued_at_utc: str
+    data_mode: str
+    checkpoints: Dict[str, Dict]
+
+    def verify(self, recheck_dataset: bool = True) -> bool:
+        """Kiem tra permit hop le va tuy chon tai kiem tra fingerprint dataset tren dia."""
+        if not verify_protocol_lock_token(self.token, lock_path=self.lock_path):
+            return False
+        if recheck_dataset:
+            cur_fp = compute_dataset_fingerprint(self.dataset_root)
+            if cur_fp != self.dataset_fingerprint:
+                return False
+        return True
+
+
+def _make_lock_token(lock_payload_str: str) -> str:
+    """Tao token xac thuc HMAC cho protocol lock."""
+    return hmac.new(_PROTOCOL_SECRET, lock_payload_str.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
 def generate_protocol_lock(
     data_root: str | Path,
     checkpoint_dir: str | Path = "checkpoints",
     lock_path: str | Path = "outputs/protocol_lock.json",
     models: Optional[List[str]] = None,
     seeds: Optional[List[int]] = None,
+    data_mode: str = "real",
 ) -> Dict:
     """
     Sinh file protocol_lock.json khoa toan bo 9 checkpoints (SHA256 tinh tu dia),
-    dataset fingerprint, evaluation parameters, git commit.
+    dataset fingerprint, evaluation parameters, git commit, va timestamp UTC chuan.
+    Chi duoc goi o phase=lock (hoac chuoi all).
     """
     models = models or CANONICAL_MODELS
     seeds = seeds or CANONICAL_SEEDS
@@ -141,7 +206,28 @@ def generate_protocol_lock(
     lock_path = Path(lock_path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
 
-    print(f"[protocol_lock] Tinh dataset fingerprint tai: {data_root}")
+    # 1. Enforce Exact Canonical 3x3 o che do real
+    if data_mode == "real":
+        if set(models) != set(CANONICAL_MODELS) or set(seeds) != set(CANONICAL_SEEDS):
+            raise ValueError(
+                f"Protocol Lock error (Real mode): Bat buoc dung chinh xac 3 canonical models "
+                f"{CANONICAL_MODELS} va 3 canonical seeds {CANONICAL_SEEDS} (tong cong 9 cap duy nhat).\n"
+                f"Received models: {models}, seeds: {seeds}"
+            )
+
+        # 2. Check Git HEAD & Working tree clean
+        commit = get_git_commit()
+        if commit == "git_commit_unknown":
+            raise RuntimeError("Protocol Lock error (Real mode): Git commit khong xac dinh!")
+        if not is_git_clean():
+            raise RuntimeError(
+                "Protocol Lock error (Real mode): Git working tree dang bi dirty (chua commit)! "
+                "Hay commit toan bo thay doi truoc khi khoa protocol."
+            )
+    else:
+        commit = get_git_commit()
+
+    print(f"[protocol_lock] Tinh toan Dataset Fingerprint tren {data_root} (che do {data_mode})...")
     ds_fingerprint = compute_dataset_fingerprint(data_root)
 
     checkpoints_meta = {}
@@ -151,7 +237,6 @@ def generate_protocol_lock(
             ckpt_name = f"{m}_seed{s}_best.pth"
             ckpt_path = checkpoint_dir / ckpt_name
             if not ckpt_path.is_file():
-                # Co the nam trong checkpoint_dir / f"seed_{s}" / ckpt_name
                 alt_path = checkpoint_dir / f"seed_{s}" / ckpt_name
                 if alt_path.is_file():
                     ckpt_path = alt_path
@@ -170,9 +255,11 @@ def generate_protocol_lock(
             }
 
     lock_data = {
-        "protocol_version": "P0_P1_DETECTION_V1",
-        "timestamp_utc": str(Path(lock_path).stat().st_mtime if lock_path.exists() else ""),
-        "git_commit": get_git_commit(),
+        "protocol_version": "P0_P1_DETECTION_HARDENED_V1",
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "git_commit": commit,
+        "git_clean_at_lock": is_git_clean(),
+        "data_mode": data_mode,
         "dataset_root": str(data_root.as_posix()),
         "dataset_fingerprint": ds_fingerprint,
         "models": models,
@@ -187,50 +274,66 @@ def generate_protocol_lock(
             "baseline_conf_threshold": BASELINE_CONF_THRESHOLD,
             "baseline_nms_iou": BASELINE_NMS_IOU,
             "match_iou_threshold": MATCH_IOU_THRESHOLD,
+            "max_det": MAX_DET,
             "voc_all_points_ap": True,
             "num_classes": NUM_CLASSES,
+            "class_names": CLASS_NAMES,
+            "preprocessing_identity": PREPROCESSING_IDENTITY,
         },
     }
 
     lock_path.write_text(json.dumps(lock_data, indent=2), encoding="utf-8")
-    print(f"[protocol_lock] Da tao va khoa protocol tai: {lock_path}")
+    print(f"[protocol_lock] Da tao va khoa protocol thanh cong tai: {lock_path}")
     return lock_data
-
-
-def _make_lock_token(lock_payload_str: str) -> str:
-    """Tao token xac thuc cho protocol lock."""
-    return hmac.new(_PROTOCOL_SECRET, lock_payload_str.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 def global_preflight_check(
     lock_path: str | Path = "outputs/protocol_lock.json",
     data_root: Optional[str | Path] = None,
-) -> Tuple[bool, str]:
+    data_mode: str = "real",
+) -> Tuple[bool, PreflightPermit]:
     """
-    Kiem tra toan bo 9 checkpoints va dataset fingerprint theo protocol_lock.json.
-    Neu hop le 100%, cap `protocol_lock_token` de mo quyen truy cap TestLoader.
-    Neu bat ky dieu kien nao that bai, nem RuntimeError (Fail-Closed).
+    Kiem tra toan bo checkpoints, dataset fingerprint, git status theo protocol_lock.json.
+    Chi doc protocol_lock.json hien co, tuyet doi khong tu tao hoac ghi de lock!
+    Neu hop le 100%, cap PreflightPermit de mo quyen truy cap TestLoader.
     """
     lock_file = Path(lock_path)
     if not lock_file.is_file():
         raise RuntimeError(
-            f"Global preflight check that bai: Khong tim thay {lock_file}. "
-            f"Hay chay generate_protocol_lock() sau khi train xong develop phase."
+            f"Global preflight check that bai: Khong tim thay {lock_file}.\n"
+            f"Giai doan final-test yeu cau file lock da duoc sinh truoc tu phase=lock."
         )
 
     lock_data = json.loads(lock_file.read_text(encoding="utf-8"))
     ds_root = Path(data_root or lock_data["dataset_root"])
+    mode = data_mode or lock_data.get("data_mode", "real")
 
-    print(f"[preflight] Xac thuc Dataset Fingerprint...")
+    # 1. Kiem tra Git HEAD va Clean neu la real mode
+    if mode == "real":
+        current_commit = get_git_commit()
+        if current_commit == "git_commit_unknown":
+            raise RuntimeError("Preflight check that bai (Real mode): Git commit khong xac dinh!")
+        if current_commit != lock_data["git_commit"]:
+            raise RuntimeError(
+                f"Git HEAD mismatch! Code da bi thay doi sau khi khoa protocol.\n"
+                f"Locked commit:  {lock_data['git_commit']}\n"
+                f"Current commit: {current_commit}"
+            )
+        if not is_git_clean():
+            raise RuntimeError("Git working tree dang co uncommitted changes! Can git clean truoc khi test.")
+
+    # 2. Xac thuc Dataset Fingerprint
+    print(f"[preflight] Xac thuc Dataset Fingerprint tai: {ds_root}")
     current_ds_fp = compute_dataset_fingerprint(ds_root)
     if current_ds_fp != lock_data["dataset_fingerprint"]:
         raise RuntimeError(
-            f"Dataset Fingerprint mismatch! Data da bi thay doi sau khi khoa lock.\n"
+            f"Dataset Fingerprint mismatch! Dữ liệu đã bị thay đổi sau khi khóa protocol.\n"
             f"Expected: {lock_data['dataset_fingerprint']}\n"
             f"Actual:   {current_ds_fp}"
         )
 
-    print(f"[preflight] Xac thuc 9 checkpoints va sidecar SHA256...")
+    # 3. Xac thuc tat ca Checkpoints va Sidecars
+    print(f"[preflight] Xac thuc {len(lock_data['checkpoints'])} checkpoints va sidecar SHA256...")
     for key, info in lock_data["checkpoints"].items():
         ckpt_p = Path(info["relative_path"])
         if not ckpt_p.is_file():
@@ -258,17 +361,29 @@ def global_preflight_check(
 
     token_payload = f"{lock_data['dataset_fingerprint']}:{len(lock_data['checkpoints'])}:{lock_data['git_commit']}"
     token = _make_lock_token(token_payload)
-    print(f"[preflight] Global Preflight Passed! Cap protocol_lock_token: {token[:16]}...")
-    return True, token
+
+    permit = PreflightPermit(
+        token=token,
+        lock_path=str(lock_file.as_posix()),
+        dataset_root=str(ds_root.as_posix()),
+        dataset_fingerprint=lock_data["dataset_fingerprint"],
+        issued_at_utc=datetime.now(timezone.utc).isoformat(),
+        data_mode=mode,
+        checkpoints=lock_data["checkpoints"],
+    )
+
+    print(f"[preflight] Global Preflight Passed! Cap PreflightPermit hop le ({token[:16]}...).")
+    return True, permit
 
 
 def verify_protocol_lock_token(
-    token: Optional[str],
+    token_or_permit: Optional[Union[str, PreflightPermit]],
     lock_path: str | Path = "outputs/protocol_lock.json",
 ) -> bool:
-    """Kiem tra xem token co hop le voi protocol_lock.json hien tai khong."""
-    if not token or not isinstance(token, str):
+    """Kiem tra token hoac permit co hop le voi protocol_lock.json hien tai khong."""
+    if not token_or_permit:
         return False
+    token_str = token_or_permit.token if isinstance(token_or_permit, PreflightPermit) else token_or_permit
     lock_file = Path(lock_path)
     if not lock_file.is_file():
         return False
@@ -276,22 +391,36 @@ def verify_protocol_lock_token(
         lock_data = json.loads(lock_file.read_text(encoding="utf-8"))
         token_payload = f"{lock_data['dataset_fingerprint']}:{len(lock_data['checkpoints'])}:{lock_data['git_commit']}"
         expected_token = _make_lock_token(token_payload)
-        return hmac.compare_digest(token, expected_token)
+        return hmac.compare_digest(token_str, expected_token)
     except Exception:
         return False
 
 
 def assert_test_access_allowed(
-    token: Optional[str],
+    token_or_permit: Optional[Union[str, PreflightPermit]],
     lock_path: str | Path = "outputs/protocol_lock.json",
+    dataset_root: Optional[str | Path] = None,
 ):
     """
     Split Semantics Guard:
-    Cam tuyet doi truy cap TestLoader neu khong co token xac thuc tu preflight check.
+    Cam tuyet doi truy cap TestLoader neu khong co permit/token hop le hoac du lieu bi thay doi.
     """
-    if not verify_protocol_lock_token(token, lock_path=lock_path):
+    if not verify_protocol_lock_token(token_or_permit, lock_path=lock_path):
         raise RuntimeError(
             "TEST SET ACCESS DENIED! (Split Semantics Guard Fail-Closed)\n"
             "Ban khong the tao hoac load TestLoader trong giai doan Develop hoac khi chua vuot qua "
-            "global_preflight_check() voi protocol_lock_token hop le."
+            "global_preflight_check() voi PreflightPermit hop le."
         )
+
+    # Dynamic re-check dataset fingerprint neu co dataset_root hoac permit
+    root_to_check = dataset_root or (token_or_permit.dataset_root if isinstance(token_or_permit, PreflightPermit) else None)
+    if root_to_check and Path(root_to_check).is_dir():
+        lock_data = json.loads(Path(lock_path).read_text(encoding="utf-8"))
+        cur_fp = compute_dataset_fingerprint(root_to_check)
+        if cur_fp != lock_data["dataset_fingerprint"]:
+            raise RuntimeError(
+                "TEST SET ACCESS DENIED! (Data tampering detected after preflight check)\n"
+                f"Dataset fingerprint da bi thay doi sau khi cap permit!\n"
+                f"Expected: {lock_data['dataset_fingerprint']}\n"
+                f"Actual:   {cur_fp}"
+            )

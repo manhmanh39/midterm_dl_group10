@@ -114,8 +114,11 @@ def benchmark_detection_inference(
     throughput_fps = float((test_bs * runs_bs16) / max(total_time, 1e-6))
 
     return {
+        "benchmark_device": device.type,
+        "throughput_batch_size": test_bs,
+        "throughput_fps": round(throughput_fps, 1),
+        f"bs{test_bs}_throughput_fps": round(throughput_fps, 1),
         "bs1_latency_median_ms": round(lat_median, 2),
         "bs1_latency_mean_ms": round(lat_mean, 2),
         "bs1_latency_p95_ms": round(lat_p95, 2),
-        "bs16_throughput_fps": round(throughput_fps, 1),
     }

@@ -20,9 +20,23 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from scripts.config import CONF_THRESHOLD, IMAGE_SIZE, NUM_CLASSES, STRIDE, get_grid_size
+from scripts.config import (
+    CONF_THRESHOLD,
+    IMAGE_SIZE,
+    MAX_DET,
+    NUM_CLASSES,
+    PREPROCESSING_IDENTITY,
+    STRIDE,
+    get_grid_size,
+    get_processed_data_root,
+)
 from scripts.data.prepared_loader import get_develop_dataloaders
-from scripts.experiment_config import get_git_commit, write_checkpoint_sha256
+from scripts.experiment_config import (
+    compute_dataset_fingerprint,
+    get_git_commit,
+    is_git_clean,
+    write_checkpoint_sha256,
+)
 from scripts.models.factory import build_model, make_optimizer
 from scripts.src.metrics import evaluate_detections
 from scripts.src.utils import CombinedLocalizationLoss, calculate_iou, plot_history
@@ -87,7 +101,7 @@ def train_pipeline(
     weight_decay: Optional[float] = None,
     lambda_coord: Optional[float] = None,
     optimizer_name: Optional[str] = None,
-    data_root: str = "data/dataset_202601",
+    data_root: Optional[str] = None,
     image_size: int = IMAGE_SIZE,
     freeze_backbone: bool = False,
     unfreeze_from_layer: str = "layer3",
@@ -96,8 +110,10 @@ def train_pipeline(
     use_optuna: bool = True,
     warmup_epochs: int = 2,
     eval_every: int = 1,
+    data_mode: str = "real",
 ) -> Dict:
     set_seed(seed)
+    data_root = data_root or get_processed_data_root()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     params = {}
@@ -118,7 +134,7 @@ def train_pipeline(
 
     grid_size = get_grid_size(image_size=image_size, stride=STRIDE)
     print(f"[train] {device} | seed={seed} | {model_name} | bs={batch_size} lr={lr:.2e} "
-          f"wd={weight_decay:.1e} opt={optimizer_name} lambda_coord={lambda_coord:.2f} eval_every={eval_every}")
+          f"wd={weight_decay:.1e} opt={optimizer_name} lambda_coord={lambda_coord:.2f} eval_every={eval_every} mode={data_mode}")
 
     # Giai doan Develop: Chi lay train va val tu data_root, tuyet doi khong dong vao test
     train_loader, val_loader, train_ds, val_ds = get_develop_dataloaders(
@@ -184,6 +200,18 @@ def train_pipeline(
                 "grid_size": grid_size,
                 "freeze_backbone": freeze_backbone,
                 "unfreeze_from_layer": unfreeze_from_layer,
+                "provenance": {
+                    "dataset_fingerprint": compute_dataset_fingerprint(data_root),
+                    "git_commit": get_git_commit(),
+                    "git_dirty": not is_git_clean(),
+                    "data_mode": data_mode,
+                    "device": str(device),
+                    "stride": STRIDE,
+                    "image_size": image_size,
+                    "grid_size": grid_size,
+                    "preprocessing": PREPROCESSING_IDENTITY,
+                    "max_det": MAX_DET,
+                },
                 "hparams": {
                     "lr": lr,
                     "batch_size": batch_size,
@@ -247,7 +275,8 @@ if __name__ == "__main__":
     p.add_argument("--epochs", type=int, default=40)
     p.add_argument("--batch_size", type=int, default=None)
     p.add_argument("--lr", type=float, default=None)
-    p.add_argument("--data_root", default="data/dataset_202601")
+    p.add_argument("--data_root", default=None, help="Mac dinh su dung get_processed_data_root()")
+    p.add_argument("--data_mode", default="real", choices=["real", "demo"], help="Che do data: real hoac demo")
     p.add_argument("--image_size", type=int, default=IMAGE_SIZE)
     p.add_argument("--freeze_backbone", action="store_true")
     p.add_argument("--unfreeze_from_layer", default="layer3",
@@ -271,4 +300,5 @@ if __name__ == "__main__":
         num_workers=a.num_workers,
         use_optuna=not a.no_optuna,
         eval_every=a.eval_every,
+        data_mode=a.data_mode,
     )

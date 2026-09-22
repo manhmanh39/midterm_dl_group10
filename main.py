@@ -1,8 +1,9 @@
 """
 main.py - Dieu phoi pipeline detection VinBigData P0/P1.
 Tach biet ro rang 2 giai doan:
-  1. Giai doan DEVELOP (--phase develop): Chi su dung Train/Val loaders, tim model tot nhat.
+  1. Giai doan DEVELOP (--phase develop): Chi su dung Train/Val loaders, tim model tot nhat. Tuyet doi khong doc test.
   2. Giai doan FINAL-TEST (--phase final-test): Preflight check 9 checkpoints, mo TestLoader 1 pass duy nhat.
+(Hardened implementation theo 18 chi muc kiem toan).
 """
 from __future__ import annotations
 
@@ -41,25 +42,28 @@ def run_pipeline(
     seed: int = 202601,
     num_workers: int = 4,
     lock_token: Optional[str] = None,
+    data_mode: str = "real",
 ):
-    data_root = data_root or "data/dataset_202601"
+    data_root = data_root or get_processed_data_root()
 
     print("*" * 80)
-    print(f"VinBigData Detection Protocol | Phase: {phase.upper()} | Models: {model_names} | Seed: {seed}")
-    print(f"Data Root: {data_root} | Epochs: {epochs}")
+    print(f"VinBigData Detection Protocol | Phase: {phase.upper()} | Mode: {data_mode.upper()}")
+    print(f"Models: {model_names} | Seed: {seed} | Data Root: {data_root} | Epochs: {epochs}")
     print("*" * 80)
 
     if not is_prepared_dataset(data_root):
         print(f"[LOI] '{data_root}' khong hop le. Can dataset.yaml va 3 splits (train/val/test/images).")
         sys.exit(1)
 
-    for split, s in describe_dataset(data_root).items():
+    # Leakage Discipline: Trong phase Develop, chi describe train va val, khong doc test annotations
+    splits_to_describe = ("train", "val") if phase == "develop" else ("train", "val", "test")
+    for split, s in describe_dataset(data_root, splits=splits_to_describe).items():
         print(f"  [{split:<5}] {s['n_images']:>5} anh | {s['n_boxes']:>6} box | "
               f"No finding: {s['n_no_finding']:>5} ({s['pct_no_finding']:.1f}%) | "
               f"TB box/anh: {s['avg_boxes_per_image']:.2f}")
 
     if phase == "develop":
-        print("\n[PHASE: DEVELOP] Huan luyen tren Train + Val. TestLoader bi khoa tuyet doi.")
+        print("\n[PHASE: DEVELOP] Huan luyen tren Train + Val. TestLoader va Test annotations bi khoa tuyet doi.")
         develop_results = []
         for model_name in model_names:
             print(f"\n>>> Huan luyen {model_name.upper()} (Seed: {seed}) <<<")
@@ -75,6 +79,7 @@ def run_pipeline(
                 unfreeze_from_layer=unfreeze_from_layer,
                 checkpoint_dir=checkpoint_dir,
                 num_workers=num_workers,
+                data_mode=data_mode,
             )
             develop_results.append({"model": model_name, "seed": seed, **res})
         return develop_results
@@ -83,9 +88,16 @@ def run_pipeline(
         print("\n[PHASE: FINAL-TEST] Chay danh gia Post-Freeze tren TestLoader.")
         lock_file = os.path.join(output_dir, "protocol_lock.json")
 
+        if not os.path.isfile(lock_file):
+            raise RuntimeError(
+                f"Protocol lock file '{lock_file}' khong ton tai!\n"
+                f"Giai doan final-test khong duoc phep tu dong sinh lai lock. "
+                f"Hay chay run_multi_seed.py --phase lock truoc."
+            )
+
         if not lock_token:
             print("[final-test] Chua co lock_token. Dang thuc hien global_preflight_check()...")
-            _, lock_token = global_preflight_check(lock_path=lock_file, data_root=data_root)
+            _, lock_token = global_preflight_check(lock_path=lock_file, data_root=data_root, data_mode=data_mode)
 
         test_results = []
         for model_name in model_names:
@@ -99,6 +111,7 @@ def run_pipeline(
                 batch_size=batch_size or 16,
                 num_workers=num_workers,
                 lock_token=lock_token,
+                lock_path=lock_file,
                 output_dir=output_dir,
             )
             test_results.append({
@@ -127,7 +140,8 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--seed", type=int, default=202601)
     parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--data_root", type=str, default="data/dataset_202601")
+    parser.add_argument("--data_root", type=str, default=None)
+    parser.add_argument("--data_mode", type=str, default="real", choices=["real", "demo"])
     parser.add_argument("--image_size", type=int, default=IMAGE_SIZE)
     parser.add_argument("--freeze_backbone", action="store_true")
     parser.add_argument("--unfreeze_from_layer", type=str, default="layer3",
@@ -155,4 +169,5 @@ if __name__ == "__main__":
         seed=args.seed,
         num_workers=args.num_workers,
         lock_token=args.lock_token,
+        data_mode=args.data_mode,
     )

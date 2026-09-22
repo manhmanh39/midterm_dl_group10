@@ -21,6 +21,14 @@ GRID_SIZE = IMAGE_SIZE // STRIDE
 CONF_THRESHOLD = 0.25
 NMS_IOU_THRESHOLD = 0.45
 
+# Evaluation and baseline operating semantics constants
+MAX_DET: int = 100
+EVAL_MIN_SCORE: float = 0.01
+BASELINE_CONF_THRESHOLD: float = 0.25
+BASELINE_NMS_IOU: float = 0.45
+MATCH_IOU_THRESHOLD: float = 0.5
+PREPROCESSING_IDENTITY = ["raw", "CLAHE", "Laplacian"]
+
 LAMBDA_COORD = 5.0
 LAMBDA_OBJ = 1.0
 LAMBDA_CLASS = 1.0
@@ -37,7 +45,7 @@ def get_data_root() -> str:
 
 
 def get_processed_data_root() -> str:
-    return os.environ.get("VINBIGDATA_PROCESSED", "data/processed/dataset_202601")
+    return os.environ.get("VINBIGDATA_PROCESSED", "data/dataset_202601")
 
 
 @dataclass

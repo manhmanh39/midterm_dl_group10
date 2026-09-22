@@ -5,9 +5,10 @@ import torch
 import torchvision
 
 
-def decode_predictions(pred, conf_threshold=0.1, nms_iou_threshold=0.45, max_det=100):
+def decode_predictions(pred, conf_threshold=0.1, nms_iou_threshold=0.45, max_det=100, min_score=None):
     B, G, _, C = pred.shape
     device = pred.device
+    score_thr = min_score if min_score is not None else conf_threshold
     obj = torch.sigmoid(pred[..., 0])
     xy = torch.sigmoid(pred[..., 1:3])
     wh = torch.sigmoid(pred[..., 3:5])
@@ -24,7 +25,7 @@ def decode_predictions(pred, conf_threshold=0.1, nms_iou_threshold=0.45, max_det
 
     results = []
     for b in range(B):
-        m = score[b] > conf_threshold
+        m = score[b] > score_thr
         bx, sc, lb = boxes[b][m], score[b][m], cls_id[b][m]
         if sc.numel() == 0:
             results.append({"boxes": torch.zeros((0, 4), device=device),

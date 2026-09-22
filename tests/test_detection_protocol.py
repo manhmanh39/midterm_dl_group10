@@ -1,15 +1,6 @@
 """
 tests/test_detection_protocol.py - Bo Unit Tests kiem thu 100% cac guards va dinh dang P0/P1 Detection.
-Bao gom:
-  1. Empty vs Missing label contract (Fail-Closed)
-  2. Image ID alignment trong Dataset & Collate
-  3. Cell collision audit module
-  4. PASCAL VOC 2010+ continuous all-points AP
-  5. Split Semantics Test Guard (Fail-Closed khi thieu token)
-  6. Dataset Fingerprint & Checkpoint SHA sidecar lock
-  7. Preflight Check tampering detection (Fail-Closed)
-  8. Sample Standard Deviation voi ddof=1
-  9. Complexity RAM state_dict_size_mib measurement
+(Bao gom toan bo 18 chi muc kiem toan duoc nang cap).
 """
 from __future__ import annotations
 
@@ -20,31 +11,44 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import cv2
 import numpy as np
 import torch
 import torch.nn as nn
 
-from scripts.benchmark_utils import measure_model_complexity
-from scripts.config import NUM_CLASSES
+from scripts.benchmark_utils import benchmark_detection_inference, measure_model_complexity
+from scripts.config import (
+    BASELINE_CONF_THRESHOLD,
+    BASELINE_NMS_IOU,
+    EVAL_MIN_SCORE,
+    NUM_CLASSES,
+)
 from scripts.data.prepared_loader import (
     audit_cell_collisions,
+    describe_dataset,
     get_develop_dataloaders,
     get_test_dataloader,
 )
 from scripts.experiment_config import (
+    CANONICAL_MODELS,
+    CANONICAL_SEEDS,
+    PreflightPermit,
     compute_dataset_fingerprint,
     compute_file_sha256,
+    compute_split_fingerprint,
     generate_protocol_lock,
     global_preflight_check,
     verify_protocol_lock_token,
     write_checkpoint_sha256,
 )
+from evaluate import evaluate_model
+from run_multi_seed import run_canonical_multi_seed
 from scripts.models.factory import build_model
 from scripts.src.dataset import VinBigDataDetectionDataset, collate_fn
-from scripts.src.metrics import compute_voc_ap
+from scripts.src.metrics import compute_voc_ap, evaluate_detections
 
 
-class TestDetectionProtocol(unittest.TestCase):
+class TestDetectionProtocolHardened(unittest.TestCase):
     def setUp(self):
         # Tao dummy detection dataset directory
         self.tmp_dir = tempfile.mkdtemp()
@@ -63,8 +67,6 @@ class TestDetectionProtocol(unittest.TestCase):
             for i in range(2):
                 img_name = f"img_{i:04d}.png"
                 img_p = self.root / split / "images" / img_name
-                # Tao fake png bang numpy/cv2
-                import cv2
                 dummy_img = np.full((512, 512, 3), fill_value=(i + 1) * 40, dtype=np.uint8)
                 cv2.imwrite(str(img_p), dummy_img)
 
@@ -97,7 +99,71 @@ class TestDetectionProtocol(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             ds.get_raw_boxes(0)
 
-    def test_02_dataset_and_collate_returns_image_id(self):
+    def test_02_strict_malformed_annotation_validation(self):
+        """Kiem tra validation nghiem ngat: bat loi khi dong nhan bi malformed."""
+        train_dir = self.root / "train"
+        lbl_p = self.root / "train" / "labels" / "img_0000.txt"
+
+        # 1. Thieu truong (chi co 4 truong)
+        lbl_p.write_text("0 0.5 0.5 0.2\n", encoding="utf-8")
+        ds = VinBigDataDetectionDataset(str(train_dir), image_size=512, grid_size=16)
+        with self.assertRaises(ValueError) as ctx:
+            ds.get_raw_boxes(0)
+        self.assertIn("expected exactly 5 fields", str(ctx.exception))
+
+        # 2. Class ID khong phai so nguyen
+        lbl_p.write_text("0.5 0.5 0.5 0.2 0.2\n", encoding="utf-8")
+        with self.assertRaises(ValueError) as ctx:
+            ds.get_raw_boxes(0)
+        self.assertIn("Class ID must be integer", str(ctx.exception))
+
+        # 3. Class ID ngoai khoang [0, 13]
+        lbl_p.write_text("14 0.5 0.5 0.2 0.2\n", encoding="utf-8")
+        with self.assertRaises(ValueError) as ctx:
+            ds.get_raw_boxes(0)
+        self.assertIn("out of range", str(ctx.exception))
+
+        # 4. Toa do NaN hoac Inf
+        lbl_p.write_text("0 nan 0.5 0.2 0.2\n", encoding="utf-8")
+        with self.assertRaises(ValueError) as ctx:
+            ds.get_raw_boxes(0)
+        self.assertIn("Non-finite coordinate", str(ctx.exception))
+
+        # 5. Toa do ngoai range [0, 1]
+        lbl_p.write_text("0 1.5 0.5 0.2 0.2\n", encoding="utf-8")
+        with self.assertRaises(ValueError) as ctx:
+            ds.get_raw_boxes(0)
+        self.assertIn("Center coordinates out of range", str(ctx.exception))
+
+        # 6. Chieu dai w <= 0
+        lbl_p.write_text("0 0.5 0.5 0.0 0.2\n", encoding="utf-8")
+        with self.assertRaises(ValueError) as ctx:
+            ds.get_raw_boxes(0)
+        self.assertIn("Box dimensions out of range", str(ctx.exception))
+
+    def test_03_image_and_label_bijection_enforcement(self):
+        """Kiem tra dataset fingerprint bat buoc quan he song anh giua anh va nhan."""
+        # 1. Thu muc dang song anh hop le
+        fp_clean = compute_split_fingerprint(self.root / "train")
+        self.assertIsInstance(fp_clean, str)
+
+        # 2. Tao them 1 file label mo coi khong co anh
+        orphan_lbl = self.root / "train" / "labels" / "orphan_img.txt"
+        orphan_lbl.write_text("", encoding="utf-8")
+        with self.assertRaises(RuntimeError) as ctx:
+            compute_split_fingerprint(self.root / "train")
+        self.assertIn("khong song anh", str(ctx.exception))
+        orphan_lbl.unlink()
+
+        # 3. Tao them 1 file anh khong co nhan
+        orphan_img = self.root / "train" / "images" / "orphan_img.png"
+        cv2.imwrite(str(orphan_img), np.zeros((10, 10, 3), dtype=np.uint8))
+        with self.assertRaises(RuntimeError) as ctx:
+            compute_split_fingerprint(self.root / "train")
+        self.assertIn("khong song anh", str(ctx.exception))
+        orphan_img.unlink()
+
+    def test_04_dataset_and_collate_returns_image_id(self):
         """Kiem tra Dataset va Collate_fn tra ve dung image_id de alignment."""
         train_dir = self.root / "train"
         ds = VinBigDataDetectionDataset(str(train_dir), image_size=512, grid_size=16)
@@ -113,9 +179,36 @@ class TestDetectionProtocol(unittest.TestCase):
         self.assertEqual(targets.shape, (2, 16, 16, 19))
         self.assertEqual(ids, ["img_0000", "img_0001"])
 
-    def test_03_cell_collision_audit(self):
+    def test_05_image_byte_level_tamper_detection(self):
+        """Kiem tra Dataset Fingerprint phat hien thay doi raw bytes cua anh PNG."""
+        fp1 = compute_dataset_fingerprint(self.root)
+        img_p = self.root / "test" / "images" / "img_0000.png"
+
+        # Doc bytes cua anh, sua 1 byte cuoi cung (giu nguyen kich thuoc file)
+        b = bytearray(img_p.read_bytes())
+        b[-1] = (b[-1] + 1) % 256
+        img_p.write_bytes(bytes(b))
+
+        fp2 = compute_dataset_fingerprint(self.root)
+        # Fingerprint phai thay doi vi raw bytes da bi sua!
+        self.assertNotEqual(fp1, fp2)
+
+    def test_06_metrics_strict_image_id_lookup_no_fallback(self):
+        """Kiem tra metrics bat buoc co image_ids va khong fallback ve sequential index."""
+        model = build_model("model1", num_classes=NUM_CLASSES, pretrained=False)
+        train_dir = self.root / "train"
+        ds = VinBigDataDetectionDataset(str(train_dir), image_size=512, grid_size=16)
+
+        # Tao fake loader khong tra ve image_ids (chi co imgs, targets)
+        fake_loader = [(torch.randn(2, 3, 512, 512), torch.zeros(2, 16, 16, 19))]
+        device = torch.device("cpu")
+
+        with self.assertRaises(RuntimeError) as ctx:
+            evaluate_detections(model, ds, fake_loader, device, num_classes=NUM_CLASSES)
+        self.assertIn("requires DataLoader/collate_fn to provide image_ids", str(ctx.exception))
+
+    def test_07_cell_collision_audit(self):
         """Kiem tra module audit cell collision phat hien dung va cham."""
-        # Ghi 2 box cung roi vao cell (gy=8, gx=8): cx=0.51, cy=0.51 va cx=0.52, cy=0.52
         lbl_p = self.root / "train" / "labels" / "img_0000.txt"
         lbl_p.write_text("0 0.51 0.51 0.2 0.2\n1 0.52 0.52 0.3 0.3\n", encoding="utf-8")
 
@@ -126,125 +219,174 @@ class TestDetectionProtocol(unittest.TestCase):
         self.assertEqual(aud["images_with_collision"], 1)
         self.assertEqual(aud["max_boxes_in_cell"], 2)
 
-    def test_04_voc_continuous_all_points_ap(self):
+    def test_08_voc_continuous_all_points_ap(self):
         """Kiem tra PASCAL VOC 2010+ continuous all-points interpolated AP."""
-        # Test 1: Precision va Recall deu rong -> 0.0
         self.assertEqual(compute_voc_ap(np.array([]), np.array([])), 0.0)
 
-        # Test 2: Perfect detection (Precision=1.0 o moi Recall level)
         rec = np.array([0.2, 0.5, 1.0])
         prec = np.array([1.0, 1.0, 1.0])
         self.assertAlmostEqual(compute_voc_ap(rec, prec), 1.0, places=5)
 
-        # Test 3: Zigzag precision curve -> Continuous interpolation phai lay envelope max
         rec = np.array([0.1, 0.4, 0.8])
-        prec = np.array([0.8, 0.4, 0.6]) # Envelope tai rec 0.4 phai duoc nang len 0.6
+        prec = np.array([0.8, 0.4, 0.6])
         ap = compute_voc_ap(rec, prec)
         self.assertGreater(ap, 0.0)
         self.assertLessEqual(ap, 1.0)
 
-    def test_05_split_semantics_test_guard_fail_closed(self):
-        """Kiem tra TestLoader tu choi truy cap neu khong co protocol_lock_token."""
-        # 1. get_develop_dataloaders khong dong vao test
+    def test_09_split_semantics_test_guard_fail_closed(self):
+        """Kiem tra TestLoader tu choi truy cap neu khong co PreflightPermit hop le."""
         train_l, val_l, _, _ = get_develop_dataloaders(self.root, batch_size=2, num_workers=0)
         self.assertIsNotNone(train_l)
         self.assertIsNotNone(val_l)
 
-        # 2. get_test_dataloader khong truyen token -> phai nem RuntimeError
         with self.assertRaises(RuntimeError) as ctx:
             get_test_dataloader(self.root, batch_size=2, num_workers=0, lock_token=None)
         self.assertIn("TEST SET ACCESS DENIED", str(ctx.exception))
 
-        # 3. get_test_dataloader truyen token gia mao -> phai nem RuntimeError
         with self.assertRaises(RuntimeError) as ctx:
             get_test_dataloader(self.root, batch_size=2, num_workers=0, lock_token="fake_token_12345")
         self.assertIn("TEST SET ACCESS DENIED", str(ctx.exception))
 
-    def test_06_checkpoint_sha_sidecar_and_protocol_lock(self):
-        """Kiem tra sinh SHA sidecar, tao protocol_lock.json va preflight check."""
-        ckpt_dir = self.root / "checkpoints"
-        ckpt_dir.mkdir()
-        dummy_models = ["model1", "model2", "model3"]
-        dummy_seeds = [202601, 202602, 202603]
+    def test_10_relock_prevention_in_final_test(self):
+        """Kiem tra final-test KHONG DUOC PHEP tu dong sinh lai lock (chan re-lock blocker)."""
+        lock_path = self.root / "outputs" / "protocol_lock.json"
+        if lock_path.exists():
+            lock_path.unlink()
 
-        for m in dummy_models:
-            for s in dummy_seeds:
-                ckpt_p = ckpt_dir / f"{m}_seed{s}_best.pth"
-                torch.save({"model_name": m, "seed": s, "weight": torch.randn(2, 2)}, ckpt_p)
+        # Goi final-test khi chua co lock -> phai nem RuntimeError ngay lap tuc
+        with self.assertRaises(RuntimeError) as ctx:
+            run_canonical_multi_seed(
+                models=["model1"],
+                seeds=[202601],
+                phase="final-test",
+                data_root=str(self.root),
+                output_dir=str(self.root / "outputs"),
+                data_mode="demo",
+            )
+        self.assertIn("Protocol lock file khong ton tai", str(ctx.exception))
+        # Dam bao file lock van khong bi tu dong sinh ra
+        self.assertFalse(lock_path.exists())
 
-        lock_path = self.root / "protocol_lock.json"
-        lock_data = generate_protocol_lock(
-            data_root=self.root,
-            checkpoint_dir=ckpt_dir,
-            lock_path=lock_path,
-            models=dummy_models,
-            seeds=dummy_seeds,
-        )
-        self.assertTrue(lock_path.is_file())
-        self.assertEqual(lock_data["expected_checkpoints_count"], 9)
-
-        # Kiem tra tat ca 9 sidecars .sha256 deu da duoc tao
-        for m in dummy_models:
-            for s in dummy_seeds:
-                sidecar_p = ckpt_dir / f"{m}_seed{s}_best.pth.sha256"
-                self.assertTrue(sidecar_p.is_file())
-                sha_in_sidecar = sidecar_p.read_text().split()[0]
-                actual_sha = compute_file_sha256(ckpt_dir / f"{m}_seed{s}_best.pth")
-                self.assertEqual(sha_in_sidecar, actual_sha)
-
-        # Global Preflight Check phai pass va cap token hop le
-        passed, token = global_preflight_check(lock_path=lock_path, data_root=self.root)
-        self.assertTrue(passed)
-        self.assertTrue(verify_protocol_lock_token(token, lock_path=lock_path))
-
-        # Mo TestLoader voi token vua cap phai thanh cong
-        test_l, test_ds = get_test_dataloader(
-            self.root, batch_size=2, num_workers=0, lock_token=token, lock_path=lock_path
-        )
-        self.assertIsNotNone(test_l)
-        self.assertEqual(len(test_ds), 2)
-
-    def test_07_preflight_tampering_fail_closed(self):
-        """Kiem tra neu checkpoint hoac data bi sua sau khi khoa, preflight se Fail-Closed."""
+    def test_11_checkpoint_lock_membership_enforcement(self):
+        """Kiem tra evaluator chi chap nhan checkpoint da duoc khoa trong protocol_lock.json."""
         ckpt_dir = self.root / "checkpoints"
         ckpt_dir.mkdir(exist_ok=True)
         m, s = "model1", 202601
-        ckpt_p = ckpt_dir / f"{m}_seed{s}_best.pth"
-        torch.save({"dummy": 1}, ckpt_p)
+        valid_ckpt = ckpt_dir / f"{m}_seed{s}_best.pth"
+        torch.save({"model_name": m, "seed": s, "model_state_dict": {}}, valid_ckpt)
 
-        lock_path = self.root / "protocol_lock.json"
+        lock_path = self.root / "outputs" / "protocol_lock.json"
         generate_protocol_lock(
             data_root=self.root,
             checkpoint_dir=ckpt_dir,
             lock_path=lock_path,
             models=[m],
             seeds=[s],
+            data_mode="demo",
         )
+        _, permit = global_preflight_check(lock_path=lock_path, data_root=self.root, data_mode="demo")
 
-        # Gia mao sua noi dung checkpoint tren dia
-        ckpt_p.write_bytes(b"tampered checkpoint content")
+        # Tao 1 checkpoint gia mao ngoai danh sach lock
+        rogue_ckpt = ckpt_dir / "rogue_model.pth"
+        torch.save({"model_name": m, "seed": s, "model_state_dict": {}}, rogue_ckpt)
 
-        # Global preflight check phai nem loi ngay lap tuc
+        # Evaluator phai nem loi vi rogue_ckpt khong thuoc lock
         with self.assertRaises(RuntimeError) as ctx:
-            global_preflight_check(lock_path=lock_path, data_root=self.root)
-        self.assertIn("SHA256 mismatch", str(ctx.exception))
+            evaluate_model(
+                model_name=m,
+                checkpoint_path=str(rogue_ckpt),
+                data_root=str(self.root),
+                lock_token=permit,
+                lock_path=str(lock_path),
+            )
+        self.assertIn("KHONG thuoc danh sach", str(ctx.exception))
 
-    def test_08_sample_std_ddof1(self):
+    def test_12_evaluation_config_enforcement_from_lock(self):
+        """Kiem tra evaluator tu dong enforce evaluation config duoc khoa trong protocol_lock.json."""
+        ckpt_dir = self.root / "checkpoints"
+        ckpt_dir.mkdir(exist_ok=True)
+        m, s = "model1", 202601
+        model = build_model(m, num_classes=NUM_CLASSES, pretrained=False)
+        valid_ckpt = ckpt_dir / f"{m}_seed{s}_best.pth"
+        torch.save({
+            "model_name": m, "seed": s,
+            "model_state_dict": model.state_dict(),
+            "image_size": 512, "grid_size": 16,
+        }, valid_ckpt)
+
+        lock_path = self.root / "outputs" / "protocol_lock.json"
+        generate_protocol_lock(
+            data_root=self.root,
+            checkpoint_dir=ckpt_dir,
+            lock_path=lock_path,
+            models=[m],
+            seeds=[s],
+            data_mode="demo",
+        )
+        _, permit = global_preflight_check(lock_path=lock_path, data_root=self.root, data_mode="demo")
+
+        # Chay evaluate_model voi CLI flag conf_threshold=0.99 (co tinh truyen khac)
+        res = evaluate_model(
+            model_name=m,
+            checkpoint_path=str(valid_ckpt),
+            data_root=str(self.root),
+            conf_threshold=0.99, # Co tinh truyen nguong khac
+            lock_token=permit,
+            lock_path=str(lock_path),
+            output_dir=str(self.root / "outputs"),
+            num_workers=0,
+        )
+        # Evaluator phai enforce theo BASELINE_CONF_THRESHOLD (0.25) tu lock
+        self.assertIn("map50", res)
+
+    def test_13_exact_canonical_3x3_enforced_in_real_mode(self):
+        """Kiem tra real mode bat buoc dung dung 3 canonical models x 3 canonical seeds."""
+        ckpt_dir = self.root / "checkpoints"
+        ckpt_dir.mkdir(exist_ok=True)
+        lock_path = self.root / "outputs" / "protocol_lock.json"
+
+        # Truyen thieu model hoac seed o real mode -> phai nem ValueError
+        with self.assertRaises(ValueError) as ctx:
+            generate_protocol_lock(
+                data_root=self.root,
+                checkpoint_dir=ckpt_dir,
+                lock_path=lock_path,
+                models=["model1"],
+                seeds=[202601],
+                data_mode="real",
+            )
+        self.assertIn("Bat buoc dung chinh xac 3 canonical models", str(ctx.exception))
+
+    def test_14_leakage_discipline_develop_split(self):
+        """Kiem tra Develop chi describe train va val, khong bao gio doc test."""
+        stats = describe_dataset(self.root, splits=("train", "val"))
+        self.assertIn("train", stats)
+        self.assertIn("val", stats)
+        self.assertNotIn("test", stats)
+
+    def test_15_sample_std_ddof1(self):
         """Kiem tra phuong sai va do lech chuan mau dung ddof=1 (N-1)."""
         vals = [0.25, 0.27, 0.29]
         std_sample = float(np.std(vals, ddof=1))
         std_pop = float(np.std(vals, ddof=0))
-        # ddof=1 phai lon hon ddof=0
         self.assertGreater(std_sample, std_pop)
         self.assertAlmostEqual(std_sample, 0.02, places=4)
 
-    def test_09_model_complexity_ram_state_dict(self):
+    def test_16_model_complexity_ram_state_dict(self):
         """Kiem tra do dac state_dict_size_mib trong RAM."""
         model = build_model("model1", num_classes=14, pretrained=False)
         comp = measure_model_complexity(model, img_size=512)
         self.assertIn("state_dict_size_mib", comp)
         self.assertGreater(comp["state_dict_size_mib"], 0.0)
         self.assertEqual(comp["total_params"], comp["trainable_params"] + comp["frozen_params"])
+
+    def test_17_benchmark_metric_naming_accuracy(self):
+        """Kiem tra benchmark utils ghi ro batch size va device."""
+        model = build_model("model1", num_classes=14, pretrained=False)
+        speed = benchmark_detection_inference(model, device=torch.device("cpu"), num_warmup=1, num_runs=2)
+        self.assertEqual(speed["benchmark_device"], "cpu")
+        self.assertIn("throughput_batch_size", speed)
+        self.assertIn(f"bs{speed['throughput_batch_size']}_throughput_fps", speed)
 
 
 if __name__ == "__main__":

@@ -45,6 +45,17 @@ def get_final_test_dir(data_mode: Optional[str] = None) -> Path:
     return target
 
 
+def get_benchmark_dir(data_mode: Optional[str] = None, is_smoke: bool = False) -> Path:
+    """Trả về thư mục benchmark được phân tách theo namespace (demo / real / smoke/real)."""
+    if BENCHMARK_DIR != config.OUTPUT_DIR / "benchmarks":
+        return BENCHMARK_DIR
+    mode = data_mode if data_mode is not None else config.DEFAULT_DATA_MODE
+    prefix = Path("smoke") / "real" if is_smoke else Path("demo" if mode == "demo" else "real")
+    target = config.OUTPUT_DIR / "benchmarks" / prefix
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
 def get_git_commit(allow_fallback: bool = False) -> str:
     """Lấy mã băm Git commit hiện tại (HEAD) của repository. Fail-closed nếu thất bại."""
     try:
@@ -221,13 +232,15 @@ def generate_protocol_lock(
             + "\n".join(f"  - {m}" for m in missing_items)
         )
 
-    # P1.4: Kiểm tra set equality đúng ma trận canonical 3x3
+    # P1.4: Kiểm tra set equality và exact-nine đúng ma trận canonical 3x3
     expected_pairs = {(m, s) for m in config.CANONICAL_MODELS for s in config.CANONICAL_SEEDS}
-    actual_pairs = {(exp["model"], exp["seed"]) for exp in experiments}
+    pairs = [(exp["model"], exp["seed"]) for exp in experiments]
+    actual_pairs = set(pairs)
     if mode == "real" or (len(model_names) == 3 and len(seeds) == 3):
-        if actual_pairs != expected_pairs:
+        if len(pairs) != 9 or len(actual_pairs) != 9 or actual_pairs != expected_pairs:
             raise ValueError(
-                f"[PROTOCOL LOCK ERROR] Thí nghiệm không khớp chính xác ma trận canonical 3x3 ({len(expected_pairs)} cặp)!\n"
+                f"[PROTOCOL LOCK ERROR] Thí nghiệm không khớp chính xác ma trận canonical 3x3 ({len(expected_pairs)} cặp không trùng lặp)!\n"
+                f"  Tổng số pairs: {len(pairs)}, unique: {len(actual_pairs)}\n"
                 f"  Thiếu: {sorted(list(expected_pairs - actual_pairs))}\n"
                 f"  Thừa/Lệch: {sorted(list(actual_pairs - expected_pairs))}"
             )
@@ -325,13 +338,15 @@ def global_preflight_check(
     if not experiments:
         raise ValueError("[FAIL CLOSED] protocol_lock.json rỗng!")
 
-    # P1.4: Set equality 9 cặp canonical trên real data
+    # P1.4: Set equality & exact-nine 9 cặp canonical trên real data
     if mode == "real":
         expected_pairs = {(m, s) for m in config.CANONICAL_MODELS for s in config.CANONICAL_SEEDS}
-        actual_pairs = {(exp["model"], exp["seed"]) for exp in experiments}
-        if actual_pairs != expected_pairs:
+        pairs = [(exp["model"], exp["seed"]) for exp in experiments]
+        actual_pairs = set(pairs)
+        if len(pairs) != 9 or len(actual_pairs) != 9 or actual_pairs != expected_pairs:
             raise ValueError(
-                f"[FAIL CLOSED] protocol_lock.json không chứa đúng 9 cặp canonical (3 models x 3 seeds)!\n"
+                f"[FAIL CLOSED] protocol_lock.json không chứa đúng 9 cặp canonical (3 models x 3 seeds, không trùng lặp)!\n"
+                f"  Tổng số pairs: {len(pairs)}, unique: {len(actual_pairs)}\n"
                 f"  Thiếu: {sorted(list(expected_pairs - actual_pairs))}\n"
                 f"  Thừa/Lệch: {sorted(list(actual_pairs - expected_pairs))}"
             )
@@ -362,6 +377,16 @@ def global_preflight_check(
                 f"  Actual: {current_thresh_hash}"
             )
 
+        # ALL-9 INTERNAL PROVENANCE SEMANTIC BINDING TRƯỚC KHI MỞ TESTLOADER
+        verify_fail_closed_provenance(
+            checkpoint_path=ckpt_path,
+            threshold_path=thresh_path,
+            current_dataset_meta=current_dataset_meta,
+            expected_model=exp.get("model"),
+            expected_seed=exp.get("seed"),
+            expected_git_commit=lock_data.get("git_commit"),
+        )
+
     print(f"[preflight] ✅ GLOBAL PREFLIGHT PASS: Toàn bộ {len(experiments)} thí nghiệm hợp lệ 100%!")
     return lock_data
 
@@ -370,8 +395,11 @@ def verify_fail_closed_provenance(
     checkpoint_path: Path,
     threshold_path: Path,
     current_dataset_meta: Dict[str, Any],
+    expected_model: Optional[str] = None,
+    expected_seed: Optional[int] = None,
+    expected_git_commit: Optional[str] = None,
 ) -> None:
-    """Kiểm tra chéo fail-closed cho 1 checkpoint đơn lẻ."""
+    """Kiểm tra chéo fail-closed cho 1 checkpoint đơn lẻ kèm semantic binding với protocol lock."""
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"[FAIL CLOSED] Không tìm thấy checkpoint tại: {checkpoint_path}")
     if not threshold_path.exists():
@@ -400,15 +428,29 @@ def verify_fail_closed_provenance(
         if field != "checkpoint_sha256" and (ck_val is None or ck_val == ""):
             raise ValueError(f"[FAIL CLOSED] Checkpoint provenance thiếu trường bắt buộc: '{field}'")
 
-    th_model = str(th_prov["model_name"]).lower()
-    ck_model = str(checkpoint_data.get("model_name", ck_prov.get("model_name"))).lower()
+    th_model = str(th_prov["model_name"]).lower().strip()
+    ck_model = str(checkpoint_data.get("model_name", ck_prov.get("model_name"))).lower().strip()
     if th_model != ck_model:
         raise ValueError(f"[FAIL CLOSED] Sai lệch Model Name: {th_model} != {ck_model}")
+
+    if expected_model is not None:
+        exp_m = str(expected_model).lower().strip()
+        if th_model != exp_m or ck_model != exp_m:
+            raise ValueError(
+                f"[FAIL CLOSED] Semantic mismatch với lock: expected_model='{exp_m}', nhưng th_model='{th_model}', ck_model='{ck_model}'"
+            )
 
     th_seed = th_prov["seed"]
     ck_seed = checkpoint_data.get("seed", ck_prov.get("seed"))
     if th_seed != ck_seed:
         raise ValueError(f"[FAIL CLOSED] Sai lệch Seed: {th_seed} != {ck_seed}")
+
+    if expected_seed is not None:
+        exp_s = int(expected_seed)
+        if int(th_seed) != exp_s or int(ck_seed) != exp_s:
+            raise ValueError(
+                f"[FAIL CLOSED] Semantic mismatch với lock: expected_seed={exp_s}, nhưng th_seed={th_seed}, ck_seed={ck_seed}"
+            )
 
     th_ckpt_hash = th_prov["checkpoint_sha256"]
     if th_ckpt_hash != actual_ckpt_sha256:
@@ -427,6 +469,12 @@ def verify_fail_closed_provenance(
     ck_commit = ck_prov.get("git_commit")
     if th_commit != ck_commit:
         raise ValueError(f"[FAIL CLOSED] Git commit không khớp giữa Checkpoint ({ck_commit}) và Thresholds ({th_commit})!")
+
+    if expected_git_commit is not None:
+        if th_commit != expected_git_commit or ck_commit != expected_git_commit:
+            raise ValueError(
+                f"[FAIL CLOSED] Semantic mismatch với lock: expected_git_commit='{expected_git_commit}', nhưng th_commit='{th_commit}', ck_commit='{ck_commit}'"
+            )
 
     if not current_dataset_meta.get("is_demo_data", True):
         if ck_prov.get("git_dirty") is not False:

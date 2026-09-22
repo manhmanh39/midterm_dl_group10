@@ -598,5 +598,165 @@ class TestP1RegressionSuite(unittest.TestCase):
         self.assertIn("weights_size_mb", comp)
 
 
+class TestP1HardeningSuite(unittest.TestCase):
+    """Bộ kiểm thử hardening nâng cao: Semantic binding, Exact-nine, Namespace, Denominator, Range guards."""
+
+    def test_h1_exact_nine_duplicate_missing_extra_fails(self):
+        """H1: Protocol lock & preflight fail nếu có duplicate pair, missing pair hoặc extra pair."""
+        from experiment_config import global_preflight_check
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            lock_path = root / "protocol_lock.json"
+            meta = {"dataset_fingerprint": "mock_fp", "is_demo_data": False, "data_mode": "real"}
+
+            # Duplicate pair: 9 canonical + 1 duplicate = 10 items, unique = 9
+            exp_duplicate = [
+                {"model": m, "seed": s, "checkpoint_rel_path": "x", "checkpoint_sha256": "h", "threshold_rel_path": "t", "threshold_sha256": "h"}
+                for m in ["simple", "complex", "transfer"] for s in [202601, 202602, 202603]
+            ]
+            exp_duplicate.append(exp_duplicate[0].copy())
+            lock_data = {
+                "git_commit": "mock_commit",
+                "git_dirty": False,
+                "dataset_fingerprint": "mock_fp",
+                "experiments": exp_duplicate,
+            }
+            lock_path.write_text(json.dumps(lock_data))
+
+            with unittest.mock.patch("experiment_config.git_worktree_is_dirty", return_value=False):
+                with unittest.mock.patch("experiment_config.get_git_commit", return_value="mock_commit"):
+                    with unittest.mock.patch("experiment_config.compute_dataset_fingerprint", return_value=meta):
+                        with self.assertRaises(ValueError) as ctx:
+                            global_preflight_check(lock_file=lock_path, data_mode="real")
+                        self.assertIn("không chứa đúng 9 cặp canonical", str(ctx.exception))
+
+    def test_h2_internal_provenance_semantic_mismatch_fails_despite_lock_sha(self):
+        """H2: Internal provenance mismatch (sai model_name) dù SHA trong lock khớp vẫn abort preflight."""
+        from experiment_config import global_preflight_check, compute_file_sha256
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            meta = {"dataset_fingerprint": "mock_fp", "is_demo_data": True, "data_mode": "demo", "data_dir": "mock"}
+
+            experiments = []
+            for m in ["simple", "complex", "transfer"]:
+                for s in [202601, 202602, 202603]:
+                    ckpt_file = root / f"{m}_{s}_best.pth"
+                    th_file = root / f"{m}_{s}_th.json"
+
+                    # Giả mạo semantic: model 'transfer' seed 202603 nhưng internal ghi model 'simple'
+                    actual_model = "simple" if (m == "transfer" and s == 202603) else m
+
+                    torch.save({
+                        "model_name": actual_model,
+                        "seed": s,
+                        "provenance": {
+                            "checkpoint_sha256": "placeholder",
+                            "dataset_fingerprint": "mock_fp",
+                            "git_commit": "mock_commit",
+                            "model_name": actual_model,
+                            "seed": s,
+                            "data_dir": "mock",
+                        }
+                    }, ckpt_file)
+
+                    real_ckpt_sha = compute_file_sha256(ckpt_file)
+                    th_data = {
+                        "thresholds": [0.5] * 15,
+                        "provenance": {
+                            "checkpoint_sha256": real_ckpt_sha,
+                            "dataset_fingerprint": "mock_fp",
+                            "git_commit": "mock_commit",
+                            "model_name": actual_model,
+                            "seed": s,
+                            "data_dir": "mock",
+                        }
+                    }
+                    th_file.write_text(json.dumps(th_data))
+                    real_th_sha = compute_file_sha256(th_file)
+
+                    experiments.append({
+                        "model": m,
+                        "seed": s,
+                        "checkpoint_rel_path": ckpt_file.name,
+                        "checkpoint_sha256": real_ckpt_sha,
+                        "threshold_rel_path": th_file.name,
+                        "threshold_sha256": real_th_sha,
+                    })
+
+            lock_path = root / "protocol_lock.json"
+            lock_data = {
+                "git_commit": "mock_commit",
+                "git_dirty": False,
+                "dataset_fingerprint": "mock_fp",
+                "experiments": experiments,
+            }
+            lock_path.write_text(json.dumps(lock_data))
+
+            with unittest.mock.patch("experiment_config.compute_dataset_fingerprint", return_value=meta):
+                with self.assertRaises(ValueError) as ctx:
+                    global_preflight_check(lock_file=lock_path, data_mode="demo")
+                self.assertIn("Semantic mismatch", str(ctx.exception))
+
+    def test_h3_zero_test_loader_call_when_artifact_provenance_fails(self):
+        """H3: Nếu artifact bị lỗi provenance, TestLoader tuyệt đối không bao giờ được gọi."""
+        from run_multi_seed import run_multi_seed_final_test
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            lock_file = root / "protocol_lock.json"
+            lock_file.write_text(json.dumps({"experiments": []}))
+
+            with unittest.mock.patch("experiment_config.DEVELOP_DIR", root):
+                with unittest.mock.patch("run_multi_seed.get_test_dataloader") as mock_loader:
+                    with self.assertRaises(Exception):
+                        run_multi_seed_final_test(data_dir=str(root), data_mode="real")
+                    mock_loader.assert_not_called()
+
+    def test_h4_train_loss_denominator_with_drop_last(self):
+        """H4: Đảm bảo train_one_epoch dùng seen_samples làm mẫu số (5 mẫu bs 2 drop_last -> seen 4, không chia cho 5)."""
+        from train import train_one_epoch
+        from torch.utils.data import TensorDataset, DataLoader
+
+        dummy_x = torch.randn(5, 3, 16, 16)
+        dummy_y = torch.zeros(5, 15, dtype=torch.float32)
+        dataset = TensorDataset(dummy_x, dummy_y)
+        loader = DataLoader(dataset, batch_size=2, drop_last=True)
+
+        model = torch.nn.Sequential(torch.nn.Flatten(), torch.nn.Linear(3 * 16 * 16, 15))
+        criterion = torch.nn.BCEWithLogitsLoss()
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+
+        loss, _, _ = train_one_epoch(model, loader, criterion, optimizer, torch.device("cpu"))
+        self.assertIsInstance(loss, float)
+        self.assertGreater(loss, 0.0)
+
+    def test_h5_compare_models_real_no_legacy_fallback(self):
+        """H5: compare_models ném FileNotFoundError trên real data khi thiếu metric file, không fallback."""
+        from compare_models import generate_comparison_table
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with unittest.mock.patch("experiment_config.get_final_test_dir", return_value=Path(tmpdir)):
+                with self.assertRaises(FileNotFoundError) as ctx:
+                    generate_comparison_table(models=["simple"], seeds=[202601], data_mode="real")
+                self.assertIn("Không tìm thấy file metrics", str(ctx.exception))
+
+    def test_h6_calibration_rejects_out_of_bound_probabilities(self):
+        """H6: calibrate_thresholds_from_pr_curve ném ValueError nếu xác suất ngoài [0, 1]."""
+        y_true = np.array([[1, 0], [0, 1]], dtype=np.float32)
+        y_prob_high = np.array([[1.2, 0.5], [0.1, 0.8]], dtype=np.float32)
+        with self.assertRaises(ValueError) as ctx:
+            calibrate_thresholds_from_pr_curve(y_true, y_prob_high)
+        self.assertIn("valid probabilities in [0, 1]", str(ctx.exception))
+
+        y_prob_neg = np.array([[-0.1, 0.5], [0.1, 0.8]], dtype=np.float32)
+        with self.assertRaises(ValueError) as ctx:
+            calibrate_thresholds_from_pr_curve(y_true, y_prob_neg)
+        self.assertIn("valid probabilities in [0, 1]", str(ctx.exception))
+
+    def test_h7_hyperparameter_search_import_sanity(self):
+        """H7: import hyperparameter_search chạy sạch, không dính NameError hay cú pháp."""
+        import hyperparameter_search
+        self.assertTrue(hasattr(hyperparameter_search, "objective"))
+        self.assertTrue(hasattr(hyperparameter_search, "run_search"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

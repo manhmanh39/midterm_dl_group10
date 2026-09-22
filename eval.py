@@ -159,6 +159,8 @@ def evaluate_frozen_model(
         "threshold_sha256": compute_file_sha256(threshold_path),
         "dataset_fingerprint": dataset_meta["dataset_fingerprint"],
         "data_dir": dataset_meta.get("data_dir"),
+        "data_mode": mode,
+        "is_demo_data": dataset_meta.get("is_demo_data", True),
     }
 
     # 11. Lưu Artifacts

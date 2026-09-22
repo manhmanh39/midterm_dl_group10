@@ -112,8 +112,22 @@ def objective(
 
         scheduler = CosineAnnealingLR(optimizer, T_max=search_epochs)
 
+        is_transfer = (model_name == "transfer")
+        freeze_epochs = min(config.FREEZE_EPOCHS, max(1, search_epochs - 1)) if is_transfer else 0
+
         best_auc = 0.0
         for epoch in range(1, search_epochs + 1):
+            if is_transfer and epoch == freeze_epochs + 1:
+                # Unfreeze backbone và chuyển sang UNFREEZE_LR theo Contract A (đồng bộ train.py)
+                model.unfreeze_backbone()
+                if optimizer_name == "adamw":
+                    optimizer = AdamW(model.parameters(), lr=config.UNFREEZE_LR, weight_decay=weight_decay)
+                else:
+                    optimizer = SGD(
+                        model.parameters(), lr=config.UNFREEZE_LR, momentum=0.9, weight_decay=weight_decay
+                    )
+                scheduler = CosineAnnealingLR(optimizer, T_max=max(1, search_epochs - epoch + 1))
+
             model.train()
             for images, labels in fast_train_loader:
                 images, labels = images.to(device), labels.to(device)

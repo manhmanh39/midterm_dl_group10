@@ -140,9 +140,11 @@ def calibrate_thresholds_from_pr_curve(
     if not np.all(np.isin(y_val_true, [0, 1])):
         raise ValueError("y_val_true must contain only binary values 0 and 1.")
 
-    # Validate finite probabilities
+    # Validate finite probabilities and probability range [0, 1]
     if not np.all(np.isfinite(y_val_prob)):
         raise ValueError("y_val_prob contains non-finite values (NaN or Inf).")
+    if np.any((y_val_prob < 0.0) | (y_val_prob > 1.0)):
+        raise ValueError("y_val_prob must be valid probabilities in [0, 1]")
 
     num_classes = y_val_true.shape[1]
     if class_names is None:
@@ -204,6 +206,10 @@ def calibrate_thresholds_from_pr_curve(
         if not np.isfinite(optimal_thresh):
             raise ValueError(
                 f"[CALIBRATION ERROR] Optimal threshold is non-finite ({optimal_thresh}) for class {c} ({class_names[c]})!"
+            )
+        if not (0.0 <= optimal_thresh <= 1.0):
+            raise ValueError(
+                f"[CALIBRATION ERROR] Optimal threshold is outside [0, 1] ({optimal_thresh}) for class {c} ({class_names[c]})!"
             )
 
         chosen_f1 = float(f1[closest_idx])

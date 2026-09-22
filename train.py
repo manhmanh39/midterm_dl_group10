@@ -79,6 +79,7 @@ def train_one_epoch(model, loader, criterion, optimizer, device) -> Tuple[float,
     running_loss = 0.0
     c_label, t_label = 0, 0
     c_exact, t_exact = 0, 0
+    seen_samples = 0
 
     pbar = tqdm(loader, desc="  [Train]", leave=False)
     for images, labels in pbar:
@@ -92,6 +93,7 @@ def train_one_epoch(model, loader, criterion, optimizer, device) -> Tuple[float,
         optimizer.step()
 
         bs = images.size(0)
+        seen_samples += bs
         running_loss += loss.item() * bs
         c_lbl, t_lbl, c_ex, t_ex = _compute_batch_metrics(outputs, labels)
         c_label += c_lbl
@@ -100,10 +102,10 @@ def train_one_epoch(model, loader, criterion, optimizer, device) -> Tuple[float,
         t_exact += t_ex
         pbar.set_postfix({"loss": f"{loss.item():.4f}"})
 
-    n = max(1, len(loader.dataset))
+    train_loss = running_loss / max(1, seen_samples)
     per_label_acc = c_label / max(1, t_label)
     exact_match_acc = c_exact / max(1, t_exact)
-    return running_loss / n, per_label_acc, exact_match_acc
+    return train_loss, per_label_acc, exact_match_acc
 
 
 def validate_one_epoch(
@@ -115,6 +117,7 @@ def validate_one_epoch(
 ) -> Tuple[float, float, float, float, int]:
     model.eval()
     running_loss = 0.0
+    seen_samples = 0
     c_label, t_label = 0, 0
     c_exact, t_exact = 0, 0
     all_probs, all_labels = [], []
@@ -126,7 +129,9 @@ def validate_one_epoch(
             outputs = model(images)
             loss = criterion(outputs, labels)
 
-            running_loss += loss.item() * images.size(0)
+            bs = images.size(0)
+            seen_samples += bs
+            running_loss += loss.item() * bs
             c_lbl, t_lbl, c_ex, t_ex = _compute_batch_metrics(outputs, labels)
             c_label += c_lbl
             t_label += t_lbl
@@ -137,8 +142,7 @@ def validate_one_epoch(
                 all_probs.append(torch.sigmoid(outputs).cpu().numpy())
                 all_labels.append(labels.cpu().numpy())
 
-    n = max(1, len(loader.dataset))
-    val_loss = running_loss / n
+    val_loss = running_loss / max(1, seen_samples)
     val_per_label_acc = c_label / max(1, t_label)
     val_exact_match_acc = c_exact / max(1, t_exact)
 

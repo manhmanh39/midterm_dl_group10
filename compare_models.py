@@ -34,11 +34,17 @@ def generate_comparison_table(
     models: List[str] = ["simple", "complex", "transfer"],
     seeds: List[int] = [202601, 202602, 202603],
     output_dir: Path = config.OUTPUT_DIR,
+    data_mode: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Thu thập artifacts từ outputs/final_test và outputs/benchmarks,
-    sinh bảng so sánh markdown, CSV và JSON.
+    sinh bảng so sánh markdown, CSV và JSON theo namespace data_mode.
     """
+    from experiment_config import get_final_test_dir, get_benchmark_dir
+    mode = data_mode if data_mode is not None else config.DEFAULT_DATA_MODE
+    test_dir = get_final_test_dir(data_mode=mode)
+    bench_dir = get_benchmark_dir(data_mode=mode)
+
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -53,15 +59,32 @@ def generate_comparison_table(
     for model in models:
         test_runs = []
         for s in seeds:
-            metric_file = FINAL_TEST_DIR / f"{model}_seed{s}_metrics.json"
-            if metric_file.exists():
+            metric_file = test_dir / f"{model}_seed{s}_metrics.json"
+            if mode == "real":
+                # Trên dữ liệu thật: KHÔNG legacy fallback! Fail closed nếu thiếu metric file
+                if not metric_file.exists():
+                    raise FileNotFoundError(
+                        f"[FAIL CLOSED] Không tìm thấy file metrics cho {model} seed {s} tại: {metric_file}\n"
+                        "Giao thức P1 cấm legacy fallback khi đánh giá trên dữ liệu thật."
+                    )
                 with open(metric_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
                     summary = data.get("summary_metrics", data)
                     test_runs.append(summary)
+            else:
+                # Trên môi trường demo: kiểm tra test_dir trước, sau đó fallback về FINAL_TEST_DIR legacy
+                if not metric_file.exists() and (FINAL_TEST_DIR / f"{model}_seed{s}_metrics.json").exists():
+                    metric_file = FINAL_TEST_DIR / f"{model}_seed{s}_metrics.json"
+                if metric_file.exists():
+                    with open(metric_file, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                        summary = data.get("summary_metrics", data)
+                        test_runs.append(summary)
 
         # Benchmark
-        bench_file = BENCHMARK_DIR / f"{model}.json"
+        bench_file = bench_dir / f"{model}.json"
+        if not bench_file.exists() and (BENCHMARK_DIR / f"{model}.json").exists():
+            bench_file = BENCHMARK_DIR / f"{model}.json"
         bench_data = {}
         if bench_file.exists():
             with open(bench_file, "r", encoding="utf-8") as f:

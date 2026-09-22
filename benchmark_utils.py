@@ -135,9 +135,14 @@ def benchmark_model_forward(
 def save_benchmark(
     benchmark_data: Dict[str, Any],
     model_name: str,
-    output_dir: Path = config.OUTPUT_DIR / "benchmarks",
+    output_dir: Optional[Path] = None,
+    data_mode: Optional[str] = None,
+    is_smoke: bool = False,
 ) -> Path:
-    """Lưu kết quả benchmark vào outputs/benchmarks/{model_name}.json."""
+    """Lưu kết quả benchmark vào outputs/benchmarks/{namespace}/{model_name}.json."""
+    if output_dir is None:
+        from experiment_config import get_benchmark_dir
+        output_dir = get_benchmark_dir(data_mode=data_mode, is_smoke=is_smoke)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 

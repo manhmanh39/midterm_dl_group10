@@ -64,6 +64,22 @@ def run_multi_seed_develop(
             "Giao thức P1 bắt buộc working tree phải sạch (git status clean) khi chạy develop trên dữ liệu thật."
         )
 
+    # P1.4 Early Guard: Trên dữ liệu thật, từ chối ngay lập tức nếu models/seeds không phải canonical 3x3
+    if mode == "real":
+        if (
+            len(models) != 3
+            or len(set(models)) != 3
+            or set(models) != set(config.CANONICAL_MODELS)
+            or len(seeds) != 3
+            or len(set(seeds)) != 3
+            or set(seeds) != set(config.CANONICAL_SEEDS)
+        ):
+            raise ValueError(
+                f"[FAIL CLOSED] Trên dữ liệu thật, run_multi_seed_develop bắt buộc phải chạy đúng ma trận canonical 3x3!\n"
+                f"  Models nhận được: {models} (yêu cầu {config.CANONICAL_MODELS})\n"
+                f"  Seeds nhận được: {seeds} (yêu cầu {config.CANONICAL_SEEDS})"
+            )
+
     device = config.DEVICE
 
     for model_name in models:
@@ -207,7 +223,7 @@ def run_multi_seed_final_test(
     print("\n" + "=" * 80)
     print("TỔNG HỢP KẾT QUẢ ĐA SEED VÀ XUẤT BẢNG SO SÁNH")
     print("=" * 80)
-    summary_table = generate_comparison_table(models=models, seeds=seeds)
+    summary_table = generate_comparison_table(models=models, seeds=seeds, data_mode=mode)
     return summary_table
 
 

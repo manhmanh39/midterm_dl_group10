@@ -192,6 +192,7 @@ def run_multi_seed_final_test(
                 device=device,
                 data_dir=data_dir,
                 save_artifacts=True,
+                data_mode=mode,
             )
 
     # 4. Sinh bảng so sánh tổng hợp

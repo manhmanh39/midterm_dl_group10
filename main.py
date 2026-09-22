@@ -65,12 +65,14 @@ def run_develop_phase(
         print(f"### [DEVELOP] TIẾN HÀNH CHO MÔ HÌNH: {model_name.upper()} ###")
         print("#" * 80)
 
-        # 1. Giải quyết cấu hình
+        # [P0 - Item 3: Cho main.py support tuned config rõ ràng]
+        # 1. Giải quyết cấu hình ưu tiên CLI > Tuned (best_hparams) > Defaults
         resolved = resolve_experiment_config(
             model_name=model_name,
             cli_args=cli_args,
             use_tuned=cli_args.use_tuned,
         )
+        print(f"[config] Tham số đã resolve cho {model_name}: {resolved}")
 
         # 2. Huấn luyện và lưu Checkpoint tốt nhất trên Validation
         ckpt_path = train(
@@ -102,6 +104,7 @@ def run_develop_phase(
             model_kwargs["backbone_name"] = resolved["backbone"]
         if resolved.get("dropout") is not None:
             model_kwargs["dropout"] = resolved["dropout"]
+        # [P0 - Item 4: Eval transfer với pretrained=False] Không tải lại weights ImageNet khi nạp checkpoint
         model_kwargs["pretrained"] = False
         model_kwargs["freeze_base"] = False
 
@@ -112,7 +115,8 @@ def run_develop_phase(
         print(f">>> [DEVELOP] Thu thập Validation Predictions để tìm T* theo PR Curve...")
         y_val_true, y_val_prob, _ = collect_predictions(model, val_loader, device=device)
 
-        # 4. Hiệu chuẩn ngưỡng theo PR Curve
+        # [P1 - Item 7: Tune threshold theo từng class trên validation]
+        # 4. Hiệu chuẩn ngưỡng tối ưu hóa F1 theo từng class trên tập Validation
         calib_res = calibrate_thresholds_from_pr_curve(y_val_true, y_val_prob, class_names=class_names)
         save_calibrated_thresholds(
             threshold_dict=calib_res,
@@ -141,7 +145,9 @@ def run_final_test_phase(
     data_mode: Optional[str] = None,
 ) -> None:
     """
-    PHASE 2: FINAL TEST (Đánh giá các mô hình đã đóng băng hoàn toàn)
+    [P1 - Item 10: Chạy final test đúng một lần sau model selection]
+    PHASE 2: FINAL TEST (Đánh giá các mô hình đã đóng băng hoàn toàn).
+    Bảo đảm nguyên tắc: Chỉ chạy Test đúng một lần duy nhất sau khi đã khóa artifacts bằng protocol_lock.json.
     """
     mode = data_mode if data_mode is not None else config.DEFAULT_DATA_MODE
     print("\n" + "=" * 80)
@@ -236,7 +242,13 @@ if __name__ == "__main__":
     parser.add_argument("--optimizer", type=str, default=None, choices=["adamw", "sgd"])
     parser.add_argument("--weight_decay", type=float, default=None)
     parser.add_argument("--dropout", type=float, default=None)
-    parser.add_argument("--use_tuned", action="store_true", default=False)
+    # [P0 - Item 3: Cho main.py support tuned config rõ ràng]
+    parser.add_argument(
+        "--use_tuned",
+        action="store_true",
+        default=False,
+        help="[P0.3] Kích hoạt cấu hình tối ưu (best_hparams) tìm được từ hyperparameter search cho các mô hình",
+    )
     parser.add_argument("--data_dir", type=str, default=None)
     parser.add_argument("--data_mode", type=str, default=config.DEFAULT_DATA_MODE, choices=["real", "demo"])
     parser.add_argument("--seed", type=int, default=config.SEED)
@@ -246,13 +258,14 @@ if __name__ == "__main__":
     args = parser.parse_args()
     selected_models = ["simple", "complex", "transfer"] if args.model == "all" else [args.model]
 
+    # [P1 - Item 10: Chạy final test đúng một lần sau model selection]
     # KHÓA BẢO VỆ CHỐNG DATA LEAKAGE TRÊN DATA THẬT
     if args.phase == "all" and args.data_mode == "real":
         raise ValueError(
-            "\n[BẢO VỆ GIAO THỨC] CẤM dùng '--phase all' trên dataset thật để tránh rò rỉ dữ liệu test.\n"
+            "\n[BẢO VỆ GIAO THỨC] [P1.10] CẤM dùng '--phase all' trên dataset thật để tránh rò rỉ dữ liệu test.\n"
             "Quy trình khoa học bắt buộc:\n"
-            "  1. python main.py --phase develop --data_mode real --model ...\n"
-            "  2. python main.py --phase final-test --data_mode real --model ..."
+            "  1. python main.py --phase develop --data_mode real --model ... (chọn model & calibrate)\n"
+            "  2. python main.py --phase final-test --data_mode real --model ... (chạy test đóng băng đúng một lần)"
         )
 
     if args.phase in ("develop", "all"):

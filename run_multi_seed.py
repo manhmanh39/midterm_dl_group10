@@ -33,6 +33,7 @@ from experiment_config import (
 from compare_models import generate_comparison_table
 
 
+# [P1 - Item 11: Chạy 3–5 seeds]
 DEFAULT_SEEDS = list(config.CANONICAL_SEEDS)
 DEFAULT_MODELS = list(config.CANONICAL_MODELS)
 
@@ -45,8 +46,9 @@ def run_multi_seed_develop(
     data_mode: Optional[str] = None,
 ) -> Path:
     """
-    PHASE 1 (DEVELOP): Huấn luyện toàn bộ models x seeds, calibrate trên validation,
-    sinh benchmark và khóa manifest bằng protocol_lock.json.
+    [P1 - Item 11: Chạy 3–5 seeds] & [P1 - Item 10: Chạy final test đúng một lần sau model selection]
+    PHASE 1 (DEVELOP): Huấn luyện toàn bộ models x 3-5 seeds, calibrate ngưỡng trên validation,
+    sinh standardized benchmark và khóa chặt manifest bằng protocol_lock.json.
     Tuyệt đối KHÔNG mở hoặc tạo Test DataLoader!
     """
     mode = data_mode if data_mode is not None else config.DEFAULT_DATA_MODE
@@ -127,6 +129,7 @@ def run_multi_seed_develop(
                 model_kwargs["backbone_name"] = resolved["backbone"]
             if resolved.get("dropout") is not None:
                 model_kwargs["dropout"] = resolved["dropout"]
+            # [P0 - Item 4: Eval transfer với pretrained=False] Nạp lại checkpoint đã đóng băng không tải ImageNet
             model_kwargs["pretrained"] = False
             model_kwargs["freeze_base"] = False
 
@@ -168,6 +171,9 @@ def run_multi_seed_final_test(
     data_mode: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
+    [P1 - Item 10: Chạy final test đúng một lần sau model selection] &
+    [P1 - Item 11: Chạy 3–5 seeds] &
+    [P1 - Item 12: Tạo comparison table]
     PHASE 2 (FINAL-TEST):
     1. Global Preflight Check trên toàn bộ 9 artifacts.
     2. Nếu PASS 100% -> Tạo Test DataLoader duy nhất.

@@ -37,6 +37,7 @@ from experiment_config import (
 )
 
 
+# [P0 - Item 1: Cho train() nhận optimizer, weight_decay, dropout]
 def _build_optimizer(params, optimizer_name: str, lr: float, weight_decay: float):
     opt_type = optimizer_name.lower().strip()
     if opt_type == "sgd":
@@ -53,16 +54,19 @@ def _build_scheduler(optimizer, epochs: int):
     return CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
 
 
+# [P0 - Item 5: Sửa exact_match_accuracy]
 def _compute_batch_metrics(outputs: torch.Tensor, labels: torch.Tensor) -> Tuple[int, int, int, int]:
     """
-    P0.5: Tính toán song song:
-      1. Per-label accuracy: Đúng từng phần tử nhãn trên toàn bộ nhãn (tp + tn) / (num_classes * batch_size)
-      2. Exact-match accuracy: Toàn bộ 15 nhãn của một mẫu phải khớp 100%
+    [P0 - Item 5: Sửa exact_match_accuracy]
+    Tính toán phân biệt rõ ràng hai khái niệm accuracy:
+      1. Per-label accuracy: Tỷ lệ đúng từng nhãn đơn lẻ trên tổng số nhãn (tp + tn) / (num_classes * batch_size)
+      2. Exact-match accuracy: Tỷ lệ mẫu mà toàn bộ 15 nhãn phải khớp chính xác 100% (preds == labels).all(dim=1)
     """
     if config.IS_MULTILABEL:
         preds = (torch.sigmoid(outputs) >= config.MULTILABEL_THRESHOLD).float()
         per_label_correct = (preds == labels).sum().item()
         total_labels = labels.numel()
+        # Exact-match: bắt buộc tất cả 15 classes cùng đúng
         exact_match_correct = (preds == labels).all(dim=1).sum().item()
         total_samples = labels.size(0)
     else:
@@ -184,7 +188,9 @@ def train(
     **kwargs: Any,
 ) -> Path:
     """
-    Huấn luyện mô hình thuần túy, lưu Checkpoint tốt nhất và Lưu Toàn Bộ History.
+    [P0 - Item 1: Cho train() nhận optimizer, weight_decay, dropout]
+    Huấn luyện mô hình với đầy đủ siêu tham số tùy chỉnh hoặc tuned (optimizer, weight_decay, dropout),
+    lưu Checkpoint tốt nhất trên validation và lưu toàn bộ Training History (JSON/CSV).
     """
     mode = data_mode if data_mode is not None else config.DEFAULT_DATA_MODE
     is_smoke = kwargs.pop("is_smoke", False)
@@ -286,7 +292,7 @@ def train(
             end="",
         )
 
-        # P0.6: Ghi nhận lịch sử huấn luyện
+        # [P0 - Item 6: Save history + metrics JSON/CSV] Ghi nhận lịch sử epoch-by-epoch
         history_records.append({
             "epoch": epoch,
             "train_loss": round(train_loss, 6),
@@ -384,7 +390,7 @@ def train(
     print(f"Huấn luyện hoàn tất trong {total_time:.2f}s! Best Epoch: {best_epoch} (Metric: {best_metric_value:.4f})")
     print("-" * 75)
 
-    # P0.6: LƯU LỊCH SỬ HUẤN LUYỆN RA JSON VÀ CSV
+    # [P0 - Item 6: Save history + metrics JSON/CSV] Lưu lịch sử huấn luyện ra JSON và CSV
     history_json_path = save_dir / "history.json"
     history_csv_path = save_dir / "history.csv"
 

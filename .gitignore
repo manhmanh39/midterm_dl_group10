@@ -23,6 +23,7 @@ outputs/final_test/
 outputs/smoke/
 outputs/benchmarks/
 outputs/*.json
+!outputs/best_hparams_*.json
 outputs/*.csv
 outputs/*.md
 outputs/protocol_lock.json

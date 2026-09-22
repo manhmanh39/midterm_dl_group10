@@ -184,7 +184,8 @@ def generate_protocol_lock(
     develop_dir: Optional[Path] = None,
 ) -> Path:
     """
-    Sinh file protocol_lock.json khóa toàn bộ 9 bộ thí nghiệm
+    [P1 - Item 10: Chạy final test đúng một lần sau model selection]
+    Sinh file protocol_lock.json khóa toàn bộ các bộ thí nghiệm (mặc định 9: 3 models x 3 seeds)
     sau khi phase develop hoàn tất và TRƯỚC KHI mở bất kỳ final-test nào.
     Kiểm tra set equality đúng 9 cặp canonical (3 models x 3 seeds).
     """
@@ -272,6 +273,7 @@ def global_preflight_check(
     develop_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """
+    [P1 - Item 10: Chạy final test đúng một lần sau model selection]
     GLOBAL PREFLIGHT TRƯỚC KHI MỞ TEST SET:
     Kiểm tra toàn bộ các checkpoints và thresholds đã bị khóa trong protocol_lock.json.
     Nếu bất kỳ model/seed nào thiếu hoặc bị sai lệch hash -> ABORT (FAIL CLOSED).
@@ -485,8 +487,38 @@ def verify_fail_closed_provenance(
     print(f"[provenance] ✅ Verification PASS cho {th_model} (seed={th_seed}).")
 
 
+# [P0 - Item 2: Apply toàn bộ best_hparams]
+# Siêu tham số tối ưu (best_hparams) từ kết quả hyperparameter search cho cả 3 mô hình.
+DEFAULT_TUNED_HPARAMS: Dict[str, Dict[str, Any]] = {
+    "simple": {
+        "lr": 0.001405529940480306,
+        "batch_size": 16,
+        "weight_decay": 0.00025643123910659796,
+        "optimizer": "sgd",
+        "dropout": 0.4188332793712209,
+    },
+    "complex": {
+        "lr": 0.0033913335125332236,
+        "batch_size": 16,
+        "weight_decay": 0.0001644983581738635,
+        "optimizer": "sgd",
+        "dropout": 0.31168047152186096,
+    },
+    "transfer": {
+        "lr": 0.000660337652947413,
+        "batch_size": 64,
+        "weight_decay": 1.6041427053764704e-05,
+        "optimizer": "adamw",
+        "dropout": 0.4031241845704801,
+    },
+}
+
+
 def load_best_hparams(model_name: str, output_dir: Path = config.OUTPUT_DIR) -> Optional[dict]:
-    """Đọc tham số tối ưu từ best_hparams_{model_name}.json nếu có."""
+    """
+    [P0 - Item 2: Apply toàn bộ best_hparams]
+    Đọc tham số tối ưu từ best_hparams_{model_name}.json nếu có, fallback sang DEFAULT_TUNED_HPARAMS.
+    """
     alias_map = {
         "model1": "simple", "model1_simple": "simple",
         "model2": "complex", "model2_complex": "complex",
@@ -501,8 +533,9 @@ def load_best_hparams(model_name: str, output_dir: Path = config.OUTPUT_DIR) -> 
                 data = json.load(f)
                 return data.get("best_params", {})
         except Exception:
-            return None
-    return None
+            pass
+    # Fallback to embedded best_hparams
+    return DEFAULT_TUNED_HPARAMS.get(canonical)
 
 
 def resolve_experiment_config(
@@ -511,7 +544,10 @@ def resolve_experiment_config(
     use_tuned: bool = False,
     **overrides: Any,
 ) -> Dict[str, Any]:
-    """Bộ giải quyết cấu hình tập trung: CLI > Tuned > Defaults."""
+    """
+    [P0 - Item 2: Apply toàn bộ best_hparams] & [P0 - Item 3: Cho main.py support tuned config rõ ràng]
+    Bộ giải quyết cấu hình tập trung theo thứ bậc ưu tiên: CLI > Tuned (best_hparams) > Defaults.
+    """
     canonical_model = model_name.lower().strip()
     dropout_default = 0.3 if canonical_model in ("transfer", "model3", "base") else 0.4
 
@@ -526,6 +562,7 @@ def resolve_experiment_config(
     }
     source = {k: "default" for k in resolved}
 
+    # [P0 - Item 2: Apply toàn bộ best_hparams] Nạp toàn bộ siêu tham số tốt nhất
     if use_tuned:
         tuned_params = load_best_hparams(canonical_model) or {}
         if tuned_params:
@@ -570,7 +607,11 @@ def save_calibrated_thresholds(
     dataset_meta: Dict[str, Any],
     save_dir: Optional[Path] = None,
 ) -> Path:
-    """Lưu thresholds calibrated vào cùng thư mục với checkpoint."""
+    """
+    [P1 - Item 7: Tune threshold theo từng class trên validation]
+    Lưu calibrated thresholds T* và toàn bộ metadata provenance vào calibrated_thresholds.json
+    cùng thư mục với best checkpoint.
+    """
     checkpoint_path = Path(checkpoint_path)
     if save_dir is None:
         save_dir = checkpoint_path.parent

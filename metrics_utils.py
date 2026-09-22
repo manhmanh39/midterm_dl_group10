@@ -12,9 +12,11 @@ from tqdm import tqdm
 import config
 
 
+# [P1 - Item 8: Thêm PR-AUC]
 def safe_average_precision(y_true: np.ndarray, y_prob: np.ndarray) -> float:
     """
-    Tính Average Precision (AP) an toàn theo protocol policy của dự án.
+    [P1 - Item 8: Thêm PR-AUC]
+    Tính Average Precision (AP / PR-AUC) an toàn theo protocol policy của dự án.
     Nếu ground-truth chỉ có 1 class (toàn 0 hoặc toàn 1), tự động trả về NaN.
     """
     if np.unique(y_true).size < 2:
@@ -38,13 +40,15 @@ def safe_roc_auc(y_true: np.ndarray, y_prob: np.ndarray) -> float:
         return float("nan")
 
 
+# [P1 - Item 9: Report macro metric của 14 pathologies riêng]
 def compute_safe_macro_auc(
     y_true: np.ndarray,
     y_prob: np.ndarray,
     class_indices: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
-    P1.6: Tính Macro-AUC an toàn cho danh sách class_indices (mặc định 14 pathologies 0..13).
+    [P1 - Item 9: Report macro metric của 14 pathologies riêng]
+    Tính Macro-AUC an toàn cho danh sách class_indices (mặc định 14 pathologies 0..13, loại trừ No Finding).
     - Trả về {'macro_auc': float, 'valid_classes': int, 'per_class_auc': Dict[int, Optional[float]]}
     - Nếu valid_classes == 0: macro_auc = float('nan'), valid_classes = 0.
     - Nếu có một số lớp thiếu support: nanmean trên các lớp hợp lệ và báo valid_classes.
@@ -122,9 +126,11 @@ def calibrate_thresholds_from_pr_curve(
     class_names: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
-    P1.5: Calibration threshold trên tập validation dựa trên Precision-Recall curve.
+    [P1 - Item 7: Tune threshold theo từng class trên validation]
+    Calibration threshold tối ưu theo từng class trên tập validation dựa trên Precision-Recall curve.
     - Validate y_val_true chỉ chứa {0, 1}
     - Validate y_val_prob hữu hạn (finite)
+    - Tìm ngưỡng T* tối đa hóa F1-score riêng biệt cho từng bệnh lý
     - Fallback về 0.5 (val_f1=None, status='fallback') CHỈ khi n_pos == 0 hoặc n_neg == 0.
     - Nếu n_pos > 0 và n_neg > 0: bất kỳ trường hợp nào như thresholds rỗng, f1 non-positive/NaN,
       hoặc threshold không finite đều raise ValueError.
@@ -369,10 +375,12 @@ def compute_per_class_table(
     return per_class_records
 
 
+# [P1 - Item 8: Thêm PR-AUC] & [P1 - Item 9: Report macro metric của 14 pathologies riêng]
 def compute_macro_metrics(per_class_records: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
+    [P1 - Item 9: Report macro metric của 14 pathologies riêng] & [P1 - Item 8: Thêm PR-AUC]
     Tính các chỉ số tổng hợp (Macro Metrics) tách riêng cho:
-      - PRIMARY: 14 Pathologies (indices 0..13)
+      - PRIMARY: 14 Pathologies (indices 0..13) bao gồm Macro ROC-AUC và Macro PR-AUC (Average Precision)
       - SECONDARY: All 15 Classes (indices 0..14)
     Báo cáo kèm số lớp hợp lệ (valid classes count) cho từng metric.
     """

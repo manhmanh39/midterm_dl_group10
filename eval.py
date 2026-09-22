@@ -78,6 +78,7 @@ def evaluate_frozen_model(
         model_kwargs["backbone_name"] = backbone_name
     if dropout is not None:
         model_kwargs["dropout"] = dropout
+    # [P0 - Item 4: Eval transfer với pretrained=False] Không load lại weights ImageNet khi đánh giá frozen model từ checkpoint
     model_kwargs["pretrained"] = False
     model_kwargs["freeze_base"] = False
 
@@ -102,7 +103,8 @@ def evaluate_frozen_model(
     y_prob = np.concatenate(all_probs, axis=0)
     y_true = np.concatenate(all_labels, axis=0)
 
-    # 5. Phân nhánh nhị phân hóa: Fixed 0.5 vs Calibrated T*
+    # [P1 - Item 7: Tune threshold theo từng class trên validation]
+    # 5. Phân nhánh nhị phân hóa: Fixed 0.5 vs Calibrated T* (tìm được từ PR Curve trên validation)
     fixed_thresholds = np.full(num_classes, 0.5, dtype=np.float32)
     y_pred_fixed_raw = apply_thresholds(y_prob, fixed_thresholds)
     y_pred_cal_raw = apply_thresholds(y_prob, calibrated_thresholds)
@@ -115,11 +117,13 @@ def evaluate_frozen_model(
     y_pred_fixed_adj = enforce_no_finding_consistency(y_pred_fixed_raw)
     y_pred_cal_adj = enforce_no_finding_consistency(y_pred_cal_raw)
 
-    # 8. Tính bảng Per-Class Table & Macro Metrics
+    # [P1 - Item 8: Thêm PR-AUC] & [P1 - Item 9: Report macro metric của 14 pathologies riêng]
+    # 8. Tính bảng Per-Class Table & Macro Metrics (AP/PR-AUC và tách riêng 14 pathologies)
     per_class_table = compute_per_class_table(y_true, y_prob, calibrated_thresholds, class_names)
     macro_metrics = compute_macro_metrics(per_class_table)
 
-    # 9. Bổ sung các chỉ số Inconsistency, Exact Match, và Per-Label Accuracy
+    # [P0 - Item 5: Sửa exact_match_accuracy]
+    # 9. Bổ sung các chỉ số Inconsistency, Exact Match Accuracy (15 nhãn đồng thời khớp 100%), và Per-Label Accuracy
     exact_match_fixed = float((y_true == y_pred_fixed_raw).all(axis=1).mean())
     exact_match_cal = float((y_true == y_pred_cal_raw).all(axis=1).mean())
     per_label_fixed = float((y_true == y_pred_fixed_raw).mean())
@@ -163,7 +167,7 @@ def evaluate_frozen_model(
         "is_demo_data": dataset_meta.get("is_demo_data", True),
     }
 
-    # 11. Lưu Artifacts
+    # [P0 - Item 6: Save history + metrics JSON/CSV] Lưu kết quả test metrics summary và per-class table ra JSON & CSV
     if save_artifacts:
         save_final_test_artifacts(
             metrics_summary=macro_metrics,

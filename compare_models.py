@@ -30,6 +30,7 @@ def compute_sample_stats(values: List[Optional[float]]) -> Dict[str, Any]:
     }
 
 
+# [P1 - Item 12: Tạo comparison table]
 def generate_comparison_table(
     models: List[str] = ["simple", "complex", "transfer"],
     seeds: List[int] = [202601, 202602, 202603],
@@ -37,8 +38,10 @@ def generate_comparison_table(
     data_mode: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Thu thập artifacts từ outputs/final_test và outputs/benchmarks,
-    sinh bảng so sánh markdown, CSV và JSON theo namespace data_mode.
+    [P1 - Item 12: Tạo comparison table]
+    Thu thập artifacts từ outputs/final_test và outputs/benchmarks trên toàn bộ các seeds,
+    tính toán Mean ± Sample Standard Deviation (ddof=1) và sinh bảng so sánh toàn diện
+    ra Markdown (protocol_comparison_table.md), CSV và JSON.
     """
     from experiment_config import get_final_test_dir, get_benchmark_dir
     mode = data_mode if data_mode is not None else config.DEFAULT_DATA_MODE
@@ -96,7 +99,7 @@ def generate_comparison_table(
 
         n_seeds = len(test_runs)
 
-        # Trích xuất thống kê
+        # [P1 - Item 8: Thêm PR-AUC] & [P1 - Item 9: Report macro metric của 14 pathologies riêng]
         auc_14 = compute_sample_stats([r.get("macro_auc_14") for r in test_runs])
         ap_14 = compute_sample_stats([r.get("macro_ap_14") for r in test_runs])
         f1_fixed_14 = compute_sample_stats([r.get("macro_f1_14_fixed") for r in test_runs])
@@ -104,7 +107,7 @@ def generate_comparison_table(
         sens_cal_14 = compute_sample_stats([r.get("mean_sensitivity_14_calibrated") for r in test_runs])
         spec_cal_14 = compute_sample_stats([r.get("mean_specificity_14_calibrated") for r in test_runs])
 
-        # P0.5: Accuracy Metrics (Per-Label & Exact Match)
+        # [P0 - Item 5: Sửa exact_match_accuracy] Phân định rõ Exact Match vs Per-Label
         per_label_fixed = compute_sample_stats([r.get("per_label_accuracy_fixed") for r in test_runs])
         per_label_cal = compute_sample_stats([r.get("per_label_accuracy_calibrated") for r in test_runs])
         exact_match_fixed = compute_sample_stats([r.get("exact_match_accuracy_fixed") for r in test_runs])

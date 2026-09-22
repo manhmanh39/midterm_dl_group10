@@ -7,9 +7,17 @@ from scripts.src.detection_head import DetectionHead
 
 
 class PretrainedDetector(nn.Module):
-    def __init__(self, num_classes: int = NUM_CLASSES, freeze_backbone: bool = False, unfreeze_from_layer: str = "layer3"):
+    # [P0.4] Transfer loading: cho phep pretrained=False de khong tai lai ImageNet khi reload
+    def __init__(
+        self,
+        num_classes: int = NUM_CLASSES,
+        freeze_backbone: bool = False,
+        unfreeze_from_layer: str = "layer3",
+        pretrained: bool = True,
+    ):
         super().__init__()
-        resnet = resnet50(weights=ResNet50_Weights.DEFAULT)
+        weights = ResNet50_Weights.DEFAULT if pretrained else None
+        resnet = resnet50(weights=weights)
         self.backbone = nn.Sequential(
             resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool,
             resnet.layer1, resnet.layer2, resnet.layer3, resnet.layer4,

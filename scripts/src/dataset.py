@@ -35,23 +35,31 @@ class VinBigDataDetectionDataset(Dataset):
         return len(self.image_files)
 
     def _read_raw_boxes(self, label_path: Path):
+        if not label_path.exists():
+            raise FileNotFoundError(
+                f"Missing label file: {label_path}. Detection dataset requires a .txt label file "
+                f"for every image (0-byte file represents No-Finding)."
+            )
+        text = label_path.read_text(encoding="utf-8").strip()
         boxes = []
-        if label_path.exists():
-            text = label_path.read_text().strip()
-            if text:
-                for line in text.splitlines():
-                    parts = line.split()
-                    if len(parts) != 5:
-                        continue
-                    cls_id = int(float(parts[0]))
-                    cx, cy, w, h = (float(v) for v in parts[1:])
-                    if 0 <= cls_id < NUM_CLASSES and w > 0 and h > 0:
-                        boxes.append((cls_id, cx, cy, w, h))
+        if text:
+            for line in text.splitlines():
+                parts = line.split()
+                if len(parts) != 5:
+                    continue
+                cls_id = int(float(parts[0]))
+                cx, cy, w, h = (float(v) for v in parts[1:])
+                if 0 <= cls_id < NUM_CLASSES and w > 0 and h > 0:
+                    boxes.append((cls_id, cx, cy, w, h))
         return boxes
 
     def get_raw_boxes(self, idx: int):
-        """GT that tu file label (khong mat box do va cham cell). Dung cho mAP."""
+        """GT that tu file label theo index (khong mat box do va cham cell)."""
         return self._read_raw_boxes(self.lbl_dir / f"{self.image_files[idx].stem}.txt")
+
+    def get_raw_boxes_by_id(self, image_id: str):
+        """GT that tu file label theo image_id (khong mat box do va cham cell). Dung cho mAP."""
+        return self._read_raw_boxes(self.lbl_dir / f"{image_id}.txt")
 
     def _encode_grid_target(self, boxes):
         G = self.grid_size
@@ -76,7 +84,8 @@ class VinBigDataDetectionDataset(Dataset):
 
     def __getitem__(self, idx: int):
         img_path = self.image_files[idx]
-        label_path = self.lbl_dir / f"{img_path.stem}.txt"
+        image_id = img_path.stem
+        label_path = self.lbl_dir / f"{image_id}.txt"
 
         img = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
         if img is None:
@@ -95,9 +104,9 @@ class VinBigDataDetectionDataset(Dataset):
 
         img = (img.astype(np.float32) / 255.0 - _MEAN) / _STD   # chuan hoa ImageNet
         img_tensor = torch.from_numpy(img).permute(2, 0, 1).contiguous()
-        return img_tensor, torch.from_numpy(target)
+        return img_tensor, torch.from_numpy(target), image_id
 
 
 def collate_fn(batch):
-    imgs, targets = zip(*batch)
-    return torch.stack(imgs, dim=0), torch.stack(targets, dim=0)
+    imgs, targets, image_ids = zip(*batch)
+    return torch.stack(imgs, dim=0), torch.stack(targets, dim=0), list(image_ids)

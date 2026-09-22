@@ -133,3 +133,8 @@ class NonSequentialCNNDetector(nn.Module):
         x = self.pool4(x)              # /32
 
         return self.head(x)            # (B, G, G, 5+num_classes)
+
+    def trainable_parameter_summary(self):
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in self.parameters())
+        return trainable, total

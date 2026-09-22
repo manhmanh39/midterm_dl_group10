@@ -6,13 +6,14 @@ from scripts.models.model2_residual import NonSequentialCNNDetector
 from scripts.models.model3_pretrained import PretrainedDetector
 
 
-def build_model(model_name, num_classes, freeze_backbone=False, unfreeze_from_layer="layer3"):
+def build_model(model_name, num_classes, freeze_backbone=False, unfreeze_from_layer="layer3", pretrained=True):
+    # [P0.1] Verify 3 architectures & [P0.4] Transfer loading with pretrained=False support
     if model_name == "model1":
         return SequentialCNNDetector(num_classes)
     if model_name == "model2":
         return NonSequentialCNNDetector(num_classes)
     if model_name == "model3":
-        return PretrainedDetector(num_classes, freeze_backbone, unfreeze_from_layer)
+        return PretrainedDetector(num_classes, freeze_backbone, unfreeze_from_layer, pretrained=pretrained)
     raise ValueError(f"Model khong hop le: {model_name}")
 
 

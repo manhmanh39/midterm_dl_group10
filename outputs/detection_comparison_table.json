@@ -1,0 +1,32 @@
+[
+  {
+    "Model Architecture": "model1",
+    "Total Params": "5,441,011",
+    "RAM (state_dict MiB)": "20.77",
+    "Latency BS=1 (ms)": "198.99",
+    "Throughput BS=16 (FPS)": "4.8",
+    "mAP@0.5 (Mean \u00b1 Std)": "N/A (Pending Final-Test)",
+    "Macro F1 (Mean \u00b1 Std)": "N/A (Pending Final-Test)",
+    "Test Loss (Mean)": "N/A"
+  },
+  {
+    "Model Architecture": "model2",
+    "Total Params": "1,641,323",
+    "RAM (state_dict MiB)": "6.28",
+    "Latency BS=1 (ms)": "146.05",
+    "Throughput BS=16 (FPS)": "5.9",
+    "mAP@0.5 (Mean \u00b1 Std)": "N/A (Pending Final-Test)",
+    "Macro F1 (Mean \u00b1 Std)": "N/A (Pending Final-Test)",
+    "Test Loss (Mean)": "N/A"
+  },
+  {
+    "Model Architecture": "model3",
+    "Total Params": "24,628,051",
+    "RAM (state_dict MiB)": "94.16",
+    "Latency BS=1 (ms)": "277.41",
+    "Throughput BS=16 (FPS)": "3.1",
+    "mAP@0.5 (Mean \u00b1 Std)": "N/A (Pending Final-Test)",
+    "Macro F1 (Mean \u00b1 Std)": "N/A (Pending Final-Test)",
+    "Test Loss (Mean)": "N/A"
+  }
+]

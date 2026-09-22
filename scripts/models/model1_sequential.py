@@ -23,3 +23,8 @@ class SequentialCNNDetector(nn.Module):
 
     def forward(self, x):
         return self.head(self.backbone(x))
+
+    def trainable_parameter_summary(self):
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in self.parameters())
+        return trainable, total

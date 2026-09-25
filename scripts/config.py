@@ -31,7 +31,7 @@ BOXES_PER_CELL = 5
 
 # score = objectness * class probability
 CONF_THRESHOLD = 0.05
-NMS_IOU_THRESHOLD = 0.45
+NMS_IOU_THRESHOLD = 0.55
 MIN_AP_SCORE = 0.0005
 MAX_DET = 1000
 

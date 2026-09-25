@@ -1,0 +1,13 @@
+{
+  "best_value_map50": 0.026138930475059913,
+  "best_params": {
+    "lr": 0.00015251209898002935,
+    "batch_size": 16,
+    "weight_decay": 5.8662688100317795e-05,
+    "optimizer": "adamw",
+    "lambda_box": 5.051914615178148,
+    "lambda_obj": 1.633326707814573,
+    "lambda_class": 0.8431972482374337,
+    "focal_gamma": 1.6154698647431895
+  }
+}

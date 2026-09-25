@@ -41,7 +41,7 @@ class DetectionHead(nn.Module):
             bias = self.head[-1].bias.view(self.boxes_per_cell, self.pred_dim)
             bias.zero_()
             # objectness prior ~= 0.01
-            bias[:, 0] = -4.6
+            bias[:, 0] = -2.2
 
     def initialize_box_prior(self, median_w: float, median_h: float):
         """Khoi tao width/height logits gan median bbox size cua train set."""

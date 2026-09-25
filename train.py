@@ -96,16 +96,16 @@ def _set_model3_stage(model, epoch, freeze_backbone, head_only_epochs, layer4_un
 
 
 def train_pipeline(
-    model_name="model1", seed=202601, epochs=40,
+    model_name="model1", seed=202601, epochs=80,
     batch_size=None, lr=None, weight_decay=None,
     lambda_box=None, lambda_obj=None, lambda_class=None,
     optimizer_name=None, focal_gamma=None,
     train_dir="data/processed/dataset_202601/train",
     val_dir="data/processed/dataset_202601/val",
     image_size=IMAGE_SIZE, freeze_backbone=False, unfreeze_from_layer="layer3",
-    checkpoint_dir="checkpoints", num_workers=20, use_optuna=True,
+    checkpoint_dir="checkpoints", num_workers=20, use_optuna=False,
     warmup_epochs=2, eval_every=2, negative_ratio=1.0,
-    head_only_epochs=3, layer4_until_epoch=12,
+    head_only_epochs=5, layer4_until_epoch=15,
 ):
     del unfreeze_from_layer  # staged policy below is the default final protocol
     set_seed(seed)
@@ -118,8 +118,8 @@ def train_pipeline(
             params = json.load(f).get("best_params", {})
         print(f"[train] Load Optuna params: {params}")
 
-    lr = lr if lr is not None else params.get("lr", 2e-4 if model_name == "model3" else 1e-3)
-    batch_size = batch_size if batch_size is not None else params.get("batch_size", 16)
+    lr = lr if lr is not None else params.get("lr", 1e-4 if model_name == "model3" else 5e-4)
+    batch_size = batch_size if batch_size is not None else params.get("batch_size", 8)
     weight_decay = weight_decay if weight_decay is not None else params.get("weight_decay", 1e-4)
     lambda_box = lambda_box if lambda_box is not None else params.get("lambda_box", LAMBDA_BOX)
     lambda_obj = lambda_obj if lambda_obj is not None else params.get("lambda_obj", LAMBDA_OBJ)
@@ -300,7 +300,7 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--model", default="model1", choices=["model1", "model2", "model3"])
     p.add_argument("--seed", type=int, default=202601)
-    p.add_argument("--epochs", type=int, default=40)
+    p.add_argument("--epochs", type=int, default=80)
     p.add_argument("--batch_size", type=int, default=None)
     p.add_argument("--lr", type=float, default=None)
     p.add_argument("--train_dir", default="data/processed/dataset_202601/train")

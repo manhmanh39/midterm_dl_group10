@@ -98,7 +98,7 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--model", default="all", choices=["model1", "model2", "model3", "all"])
     p.add_argument("--mode", default="all", choices=["all", "train", "eval"])
-    p.add_argument("--epochs", type=int, default=40)
+    p.add_argument("--epochs", type=int, default=80)
     p.add_argument("--batch_size", type=int, default=None)
     p.add_argument("--lr", type=float, default=None)
     p.add_argument("--seed", type=int, default=202601)

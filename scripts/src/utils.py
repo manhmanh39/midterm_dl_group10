@@ -86,14 +86,23 @@ class CombinedLocalizationLoss(nn.Module):
         obj_mask = target[..., 0] > 0.5
         num_pos = obj_mask.sum().clamp(min=1).float()
 
-        # Objectness focal BCE on all slots.
+        # Objectness focal BCE with separate positive/negative normalization.
+        # The previous implementation divided ALL ~G*G*A slots by num_pos.
+        # On a 32x32x3 grid this can make easy negatives dominate the gradient
+        # by hundreds of times when an image has only a few lesions.
         logit = pred[..., 0]
         tgt = target[..., 0]
         prob = torch.sigmoid(logit)
         bce = F.binary_cross_entropy_with_logits(logit, tgt, reduction="none")
         p_t = prob * tgt + (1.0 - prob) * (1.0 - tgt)
         alpha_t = self.alpha * tgt + (1.0 - self.alpha) * (1.0 - tgt)
-        obj_loss = (alpha_t * (1.0 - p_t).pow(self.gamma) * bce).sum() / num_pos
+        focal = alpha_t * (1.0 - p_t).pow(self.gamma) * bce
+        pos_obj = focal[obj_mask].sum() / num_pos
+        neg_mask = ~obj_mask
+        num_neg = neg_mask.sum().clamp(min=1).float()
+        neg_obj = focal[neg_mask].sum() / num_neg
+        # Keep negative suppression important, but never let it swamp positives.
+        obj_loss = pos_obj + 0.50 * neg_obj
 
         if not obj_mask.any():
             zero = pred.sum() * 0.0
